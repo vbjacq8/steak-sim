@@ -11,6 +11,7 @@ import vulkan_hpp;
 #endif
 
 #include<GLFW/glfw3.h>
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include<glm/glm.hpp>
 #include<glm/gtc/matrix_transform.hpp>
 
@@ -23,9 +24,15 @@ import vulkan_hpp;
 #define STB_IMAGE_IMPLEMENTATION
 #include<stb_image.h>
 
+#define TINYOBJLOADER_IMPLEMENTATION
+#include<tiny_obj_loader.h>
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
+//runtime constants; runtime occurs in build directory
+const std::string MODEL_PATH = "28_steak_loading/models/steak.obj";
+const std::string TEXTURE_PATH = "28_steak_loading/textures/textureSteak.jpeg";
 
 const std::vector<char const *>  validationLayers = {"VK_LAYER_KHRONOS_validation"};
 
@@ -58,6 +65,7 @@ struct UniformBufferObject{
     alignas(16) glm::mat4 proj;
 };
 
+/**  previous hard-coded vertex and index arrays for vulkan tutorial texture / depth load
 std::vector<Vertex> vertices = {
     {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
     {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
@@ -70,10 +78,13 @@ std::vector<Vertex> vertices = {
     {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}
 };
 
+
 std::vector<uint16_t> indices = {
     0, 1, 2, 2, 3, 0,
     4, 5, 6, 6, 7, 4
 };
+
+*/
 
 class HelloTriangleApplication{
 public:
@@ -95,9 +106,11 @@ private:
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPool();
+        createDepthResources();
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
+        loadModel();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -105,6 +118,53 @@ private:
         createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
+    }
+
+    void loadModel(){
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str())){
+            throw std::runtime_error(warn + err);
+        }
+
+        for (const auto& shape : shapes){
+            for (const tinyobj::index_t& index : shape.mesh.indices){
+                Vertex vertex{};
+                vertex.pos = {
+                    attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2],
+                };
+                vertex.texCoord = {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+                };
+
+                vertex.color = {1.0f, 1.0f, 1.0f};
+
+
+                vertices.push_back(vertex);
+                indices.push_back(indices.size());
+            }
+        }
+    }
+
+    void createDepthResources(){
+        vk::Format depthFormat = findDepthFormat();
+        std::tie(depthImage, depthImageMemory) = createImage(
+            swapchainExtent.width, 
+            swapchainExtent.height, 
+            depthFormat,
+            vk::ImageTiling::eOptimal, 
+            vk::ImageUsageFlagBits::eDepthStencilAttachment, 
+            vk::MemoryPropertyFlagBits::eDeviceLocal
+        );
+
+        depthImageView = createImageView(depthImage, depthFormat, vk::ImageAspectFlagBits::eDepth);
+
     }
 
     void createTextureSampler(){
@@ -140,7 +200,7 @@ private:
 
     void createTextureImage(){
         int texWidth, texHeight, texChannels;
-        stbi_uc *pixels = stbi_load("24_texture_image/textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc *pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         vk::DeviceSize imageSize = texWidth * texHeight * 4;
         //pointer that is returned is the first element of the array of pixel values, 4 bytes per pixel
         if (!pixels){
@@ -316,8 +376,8 @@ private:
 
         UniformBufferObject ubo{
             .model = rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f,0.0f,1.0f)),
-            .view = lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f,0.0f,0.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-            .proj = glm::perspective(glm::radians(45.0f), static_cast<float>(swapchainExtent.width) / static_cast<float>(swapchainExtent.height), 0.1f, 10.0f)
+            .view = lookAt(glm::vec3(50.0f, 2.0f, 2.0f), glm::vec3(0.0f,0.0f,0.0f), glm::vec3(1.0f, 0.0f, 0.0f)),
+            .proj = glm::perspective(glm::radians(45.0f), static_cast<float>(swapchainExtent.width) / static_cast<float>(swapchainExtent.height), 0.1f, 100.0f)
 
         };
 
@@ -761,6 +821,7 @@ private:
         cleanUpSwapchain();
         createSwapchain();
         createImageViews();
+        createDepthResources();
     }
 
     void cleanUpSwapchain(){
@@ -770,7 +831,7 @@ private:
 
     void createGraphicsPipeline(){
         // path is relative to the working directory (usually build/)
-        shaderModule = createShaderModule(readFile("27_depth_buffering_me/shaders/slang.spv"));
+        shaderModule = createShaderModule(readFile("28_model_loading_me/shaders/slang.spv"));
         vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = shaderModule, 
@@ -852,6 +913,15 @@ private:
 
         pipelineLayout = vk::raii::PipelineLayout(device, layoutInfo);
 
+
+        vk::PipelineDepthStencilStateCreateInfo depthStencil{
+            .depthTestEnable = vk::True,
+            .depthWriteEnable = vk::True,
+            .depthCompareOp = vk::CompareOp::eLess,
+            .depthBoundsTestEnable = vk::False,
+            .stencilTestEnable = vk::False
+        };
+
         vk::StructureChain<vk::GraphicsPipelineCreateInfo, vk::PipelineRenderingCreateInfo> pipelineInfochain{ 
             {
             .stageCount = 2,
@@ -859,6 +929,7 @@ private:
             .pVertexInputState = &vertexInputInfo,
             .pInputAssemblyState = &assemblyInfo,
             .pViewportState = &viewportState,
+            .pDepthStencilState = &depthStencil,
             .pRasterizationState = &rasterInfo,
             .pMultisampleState = &multisampleInfo,
             .pColorBlendState = &colorBlending,
@@ -867,7 +938,7 @@ private:
             .renderPass = nullptr
             },
 
-            {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapchainSurfaceFormat.format}
+            {.colorAttachmentCount = 1, .pColorAttachmentFormats = &swapchainSurfaceFormat.format, .depthAttachmentFormat = findDepthFormat()}
         };
 
         pipeline = vk::raii::Pipeline(device, nullptr, pipelineInfochain.get<vk::GraphicsPipelineCreateInfo>());
@@ -915,13 +986,13 @@ private:
         return minImageCount;
     }
 
-    vk::raii::ImageView createImageView(vk::Image const &image, vk::Format format){
+    vk::raii::ImageView createImageView(vk::Image const &image, vk::Format format, vk::ImageAspectFlags aspectFlags){
         vk::ImageViewCreateInfo viewInfo{
             .image = image,
             .viewType = vk::ImageViewType::e2D,
             .format = format,
             .subresourceRange = {
-                .aspectMask = vk::ImageAspectFlagBits::eColor, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1
+                .aspectMask = aspectFlags, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1
             }
         };
         return vk::raii::ImageView(device, viewInfo);
@@ -939,13 +1010,13 @@ private:
         */
 
         for (auto& image : swapchainImages){
-            swapchainImageViews.emplace_back(createImageView(image, swapchainSurfaceFormat.format));
+            swapchainImageViews.emplace_back(createImageView(image, swapchainSurfaceFormat.format, vk::ImageAspectFlagBits::eColor));
 
         }
     }
 
     void createTextureImageView(){
-        textureImageView = createImageView(*textureImage, vk::Format::eR8G8B8A8Srgb);
+        textureImageView = createImageView(*textureImage, vk::Format::eR8G8B8A8Srgb, vk::ImageAspectFlagBits::eColor);
     }
 
     static std::vector<char> readFile(const std::string& filename){
@@ -1004,16 +1075,38 @@ private:
         commandBuffer.begin({});
 
         transitionImageLayout(
-            imageIdx,
+            swapchainImages[imageIdx],
             vk::ImageLayout::eUndefined,
             vk::ImageLayout::eColorAttachmentOptimal,
             {},
             vk::AccessFlagBits2::eColorAttachmentWrite,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits2::eColorAttachmentOutput
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::ImageAspectFlagBits::eColor
             );
 
+        transitionImageLayout(
+            *depthImage,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eDepthAttachmentOptimal,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+            vk::ImageAspectFlagBits::eDepth
+        );
+
         vk::ClearValue clearColor = vk::ClearColorValue(0.0f,0.0f,0.0f,1.0f);
+        vk::ClearValue clearDepth = vk::ClearDepthStencilValue(1.0f, 0);
+
+        vk::RenderingAttachmentInfo depthAttachmentInfo = {
+            .imageView = depthImageView,
+            .imageLayout = vk::ImageLayout::eDepthAttachmentOptimal,
+            .loadOp = vk::AttachmentLoadOp::eClear,
+            .storeOp = vk::AttachmentStoreOp::eDontCare,
+            .clearValue = clearDepth
+        };
+
         vk::RenderingAttachmentInfo renderingAttachmentInfo{
             .imageView = swapchainImageViews[imageIdx],
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -1026,7 +1119,8 @@ private:
             .renderArea = {.offset = {0,0}, .extent = swapchainExtent},
             .layerCount = 1,
             .colorAttachmentCount = 1,
-            .pColorAttachments = &renderingAttachmentInfo
+            .pColorAttachments = &renderingAttachmentInfo,
+            .pDepthAttachment = &depthAttachmentInfo
             };
 
         commandBuffer.beginRendering(renderingInfo);
@@ -1036,7 +1130,7 @@ private:
         commandBuffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 
         commandBuffer.bindVertexBuffers(0, *vertexBuffer, {0});
-        commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexType::eUint16);
+        commandBuffer.bindIndexBuffer(*indexBuffer, 0, vk::IndexTypeValue<decltype(indices)::value_type>::value);
 
         commandBuffer.setViewport(
             0, 
@@ -1056,20 +1150,24 @@ private:
         commandBuffer.endRendering();
 
         transitionImageLayout(
-            imageIdx,
+            swapchainImages[imageIdx],
             vk::ImageLayout::eColorAttachmentOptimal, 
             vk::ImageLayout::ePresentSrcKHR,
             vk::AccessFlagBits2::eColorAttachmentWrite,
             {},
             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-            vk::PipelineStageFlagBits2::eBottomOfPipe
+            vk::PipelineStageFlagBits2::eBottomOfPipe,
+            vk::ImageAspectFlagBits::eColor
         );
 
         commandBuffer.end();
         
-
-
     }
+
+    /**
+     *\brief Image layout transition overload meant for texture image reads/write transitions
+    */
+
     void transitionImageLayout(
         vk::raii::CommandBuffer &commandBuffer,
         vk::raii::Image& image,
@@ -1104,15 +1202,20 @@ private:
 
         commandBuffer.pipelineBarrier(sourceStage, destinationStage, {}, {}, nullptr, barrier);
     }
+    
+    /**
+    * \brief Image layout transition used for color images and depth buffer images
+    */
 
     void transitionImageLayout(
-        uint32_t                imageIndex,
+        vk::Image image,
 	    vk::ImageLayout         old_layout,
 	    vk::ImageLayout         new_layout,
 	    vk::AccessFlags2        src_access_mask,
 	    vk::AccessFlags2        dst_access_mask,
 	    vk::PipelineStageFlags2 src_stage_mask,
-	    vk::PipelineStageFlags2 dst_stage_mask
+	    vk::PipelineStageFlags2 dst_stage_mask,
+        vk::ImageAspectFlags imageAspectFlags
     )
         {
             vk::ImageMemoryBarrier2 barrier = {
@@ -1124,9 +1227,9 @@ private:
                 .newLayout           = new_layout,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                 .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                .image               = swapchainImages[imageIndex],
+                .image               = image,
                 .subresourceRange    = {
-                    .aspectMask     = vk::ImageAspectFlagBits::eColor,
+                    .aspectMask     = imageAspectFlags,
                     .baseMipLevel   = 0,
                     .levelCount     = 1,
                     .baseArrayLayer = 0,
@@ -1179,6 +1282,26 @@ private:
 
     }
 
+    vk::Format findSupportedFormat(const std::vector<vk::Format> candidates, vk::ImageTiling tiling, vk::FormatFeatureFlags features){
+        for (const auto format : candidates){
+            vk::FormatProperties props = physicalDevice.getFormatProperties(format);
+            if (((tiling == vk::ImageTiling::eLinear) && ((props.linearTilingFeatures & features) == features)) ||
+            ((tiling == vk::ImageTiling::eOptimal) && ((props.optimalTilingFeatures & features) == features))) {
+                return format;
+            }
+
+            throw std::runtime_error("Failed to find supported format");
+        }
+    }
+
+    vk::Format findDepthFormat(){
+        return findSupportedFormat(
+            {vk::Format::eD32Sfloat, vk::Format::eD32SfloatS8Uint, vk::Format::eD24UnormS8Uint},
+            vk::ImageTiling::eOptimal,
+            vk::FormatFeatureFlagBits::eDepthStencilAttachment
+        );
+    }
+
     vk::raii::Context context;
     vk::raii::Instance instance = nullptr;
     vk::raii::PhysicalDevice physicalDevice = nullptr;
@@ -1196,8 +1319,10 @@ private:
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline pipeline = nullptr;
 
+    std::vector<Vertex> vertices;
     vk::raii::Buffer vertexBuffer = nullptr;
     vk::raii::DeviceMemory vertexBufferMemory = nullptr;
+    std::vector<uint32_t> indices;
     vk::raii::Buffer indexBuffer = nullptr;
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
 
@@ -1212,6 +1337,10 @@ private:
     vk::raii::DeviceMemory textureImageMemory = nullptr;
     vk::raii::ImageView textureImageView = nullptr;
     vk::raii::Sampler textureSampler = nullptr;
+
+    vk::raii::Image depthImage = nullptr;
+    vk::raii::DeviceMemory depthImageMemory = nullptr;
+    vk::raii::ImageView depthImageView = nullptr;
 
     vk::raii::CommandPool commandPool = nullptr;
     std::vector<vk::raii::CommandBuffer> commandBuffers;

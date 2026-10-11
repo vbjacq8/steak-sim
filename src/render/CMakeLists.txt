@@ -214,159 +214,16 @@ function(sync_directory SRC_DIR DST_DIR TARGET_NAME LABEL)
   )
 endfunction()
 
-add_chapter (00_base_code)
-
-add_chapter (00_base_code_me)
-
-add_chapter (01_instance_creation)
-
-add_chapter (01_instance_creation_me)
-
-add_chapter (02_validation_layers)
-
-add_chapter (02_validation_layers_me)
-
-add_chapter (03_physical_device_selection)
-
-add_chapter (03_physical_device_selection_me)
-
-add_chapter (04_logical_device)
-
-add_chapter (04_logical_device_me)
-
-add_chapter (05_window_surface)
-
-add_chapter (05_window_surface_me)
-
-add_chapter (06_swap_chain_creation)
-
-add_chapter (06_swap_chain_creation_me)
-
-add_chapter (07_image_views)
-
-add_chapter (07_image_views_me)
-
-add_chapter (08_graphics_pipeline)
-
-add_chapter (09_shader_modules
-  SHADER shaders/09_shader_base)
-
-add_chapter (09_shader_modules_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (10_fixed_functions
-  SHADER shaders/09_shader_base)
-
-add_chapter (10_fixed_functions_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (12_graphics_pipeline_complete
-  SHADER shaders/09_shader_base)
-
-add_chapter (12_graphics_pipeline_complete_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (14_command_buffers
-  SHADER shaders/09_shader_base)
-
-add_chapter (14_command_buffers_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (15_hello_triangle
-  SHADER shaders/09_shader_base)
-
-add_chapter (15_hello_triangle_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (16_frames_in_flight
-  SHADER shaders/09_shader_base)
-
-add_chapter (16_frames_in_flight_me
-  SHADER shaders/09_shader_base)
-
-add_chapter (17_swap_chain_recreation
-  SHADER shaders/09_shader_base)
-
-add_chapter (19_vertex_buffer
-  SHADER shaders/19_shader_vertexbuffer
-  LIBS glm::glm)
-
-add_chapter (19_vertex_buffer_me
-  SHADER shaders/19_shader_vertexbuffer
-  LIBS glm::glm)
-
-add_chapter (20_staging_buffer
-  SHADER shaders/19_shader_vertexbuffer
-  LIBS glm::glm)
-
-add_chapter (21_index_buffer
-  SHADER shaders/19_shader_vertexbuffer
-  LIBS glm::glm)
-
-add_chapter (21_index_buffer_me
-  SHADER shaders/19_shader_vertexbuffer
-  LIBS glm::glm)
-
-add_chapter (22_descriptor_layout
-  SHADER shaders/22_descriptor_layout
-  LIBS glm::glm)
-
-add_chapter (22_descriptor_layout_me
-  SHADER shaders/22_descriptor_layout
-  LIBS glm::glm)
-
-add_chapter (23_descriptor_sets_me
-  SHADER shaders/22_descriptor_layout
-  LIBS glm::glm)
-
-add_chapter (23_descriptor_sets
-  SHADER shaders/22_descriptor_layout
-  LIBS glm::glm)
-
-add_chapter (24_texture_image
-  SHADER shaders/22_descriptor_layout
-  TEXTURES ../../images/texture.jpg
-  LIBS glm::glm)
-
-add_chapter (24_texture_image_me
-  SHADER shaders/22_descriptor_layout
-  TEXTURES ../../images/texture.jpg
-  LIBS glm::glm)
-
-add_chapter (25_sampler
-  SHADER shaders/22_descriptor_layout
-  TEXTURES ../../images/texture.jpg
-  LIBS glm::glm)
-
-add_chapter (25_sampler_me
-  SHADER shaders/22_descriptor_layout
-  TEXTURES ../../images/texture.jpg
-  LIBS glm::glm)
-
-add_chapter (26_texture_mapping
-  SHADER shaders/26_texture_mapping
-  TEXTURES ../../images/texture.jpg
-  LIBS glm::glm)
-
-add_chapter (26_texture_mapping_me
-SHADER shaders/26_texture_mapping
-TEXTURES ../../images/texture.jpg
-LIBS glm::glm)
-
-add_chapter (27_depth_buffering
-SHADER shaders/27_depth_buffering
-TEXTURES ../../images/texture.jpg
-LIBS glm::glm)
-
-add_chapter (27_depth_buffering_me
-SHADER shaders/27_depth_buffering
-TEXTURES ../../images/texture.jpg
-LIBS glm::glm)
-
 add_chapter (28_model_loading
   SHADER 27_shader_depth
   MODELS viking_room.obj
   TEXTURES viking_room.png
+  LIBS glm::glm tinyobjloader::tinyobjloader)
+
+add_chapter (28_steak_loading
+  SHADER shaders/28_model_loading
+  MODELS steak.obj
+  TEXTURES textureSteak.jpeg
   LIBS glm::glm tinyobjloader::tinyobjloader)
 
 add_chapter (29_mipmapping
