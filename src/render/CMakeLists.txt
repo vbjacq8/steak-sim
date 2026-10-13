@@ -1,287 +1,67 @@
-cmake_minimum_required (VERSION 3.29)
+cmake_minimum_required(VERSION 3.29)
+project(steak_render LANGUAGES CXX)
 
-project (VulkanTutorial)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/CMake")
-
-# Add option to enable/disable C++ 20 module
-option(ENABLE_CPP20_MODULE "Enable C++ 20 module support for Vulkan" OFF)
-
-# Enable C++ module dependency scanning only if C++ 20 module is enabled
-if(ENABLE_CPP20_MODULE)
-  set(CMAKE_CXX_SCAN_FOR_MODULES ON)
-endif()
-
-find_package (glfw3 REQUIRED)
-find_package (glm REQUIRED)
-find_package (Vulkan 1.4.335 REQUIRED)      # Require Vulkan SDK version 1.4.335 or higher
-find_package (tinyobjloader REQUIRED)
-find_package (tinygltf REQUIRED)
-find_package (KTX REQUIRED)
-
-# set up Vulkan C++ module only if enabled
-if(ENABLE_CPP20_MODULE)
-  add_library(VulkanCppModule)
-  add_library(Vulkan::cppm ALIAS VulkanCppModule)
-
-  target_compile_definitions(VulkanCppModule
-          PUBLIC VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1 VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
-  )
-  target_include_directories(VulkanCppModule
-          PUBLIC
-          "${Vulkan_INCLUDE_DIR}"
-  )
-  target_link_libraries(VulkanCppModule
-          PUBLIC
-          Vulkan::Vulkan
-  )
-
-  set_target_properties(VulkanCppModule PROPERTIES CXX_STANDARD 20)
-
-  # Add MSVC-specific compiler options for proper C++ module support
-  if(MSVC)
-    target_compile_options(VulkanCppModule PRIVATE
-      /std:c++latest      # Use latest C++ standard for better module support
-      /permissive-        # Standards conformance mode
-      /Zc:__cplusplus     # Enable correct __cplusplus macro
-      /EHsc               # Enable C++ exception handling
-      /Zc:preprocessor    # Use conforming preprocessor
-      /translateInclude   # Automatically translate #include to import for standard library
-    )
-  endif()
-
-  target_sources(VulkanCppModule
-    PUBLIC
-    FILE_SET cxx_modules TYPE CXX_MODULES
-    BASE_DIRS
-    "${Vulkan_INCLUDE_DIR}"
-    FILES
-    "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.cppm"
-  )
-
-
-  # Add the vulkan.cppm file directly as a source file
-  target_sources(VulkanCppModule
-          PRIVATE
-          "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.cppm"
-  )
-else()
-  # Create a dummy interface library when C++ 20 module is disabled
-  add_library(VulkanCppModule INTERFACE)
-  add_library(Vulkan::cppm ALIAS VulkanCppModule)
-  target_link_libraries(VulkanCppModule INTERFACE Vulkan::Vulkan)
-  target_compile_definitions(VulkanCppModule
-          INTERFACE VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1 VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
-  )
-endif()
-
-find_package(stb REQUIRED)
-set(STB_INCLUDEDIR ${stb_INCLUDE_DIRS})
-
-add_executable (glslang::validator IMPORTED)
-find_program (GLSLANG_VALIDATOR "glslangValidator" HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
-set_property (TARGET glslang::validator PROPERTY IMPORTED_LOCATION "${GLSLANG_VALIDATOR}")
+find_package(Vulkan 1.4 REQUIRED)
+find_package(glfw3 REQUIRED)
 find_program(SLANGC_EXECUTABLE slangc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
 
-function (add_shaders_target TARGET)
-  cmake_parse_arguments ("SHADER" "" "CHAPTER_NAME" "SOURCES" ${ARGN})
-  if(${CMAKE_GENERATOR} MATCHES "Visual Studio.*" OR 
-      ${CMAKE_GENERATOR} MATCHES "Ninja Multi-Config")
-    set (SHADERS_DIR ${CMAKE_BINARY_DIR}/${SHADER_CHAPTER_NAME}/$<CONFIG>/shaders)
-  else()
-    set (SHADERS_DIR ${CMAKE_BINARY_DIR}/${SHADER_CHAPTER_NAME}/shaders)
-  endif()
-  add_custom_command (
-    OUTPUT ${SHADERS_DIR}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
-    )
-  add_custom_command (
-    OUTPUT ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv
-    COMMAND glslang::validator
-    ARGS --target-env vulkan1.0 ${SHADER_SOURCES} --quiet
-    WORKING_DIRECTORY ${SHADERS_DIR}
-    DEPENDS ${SHADER_SOURCES}
-    COMMENT "Compiling Shaders for ${TARGET}"
-    VERBATIM
-    )
-  add_custom_target (${TARGET} DEPENDS ${SHADERS_DIR}/frag.spv ${SHADERS_DIR}/vert.spv)
-endfunction ()
+# Header-only deps; SOURCE_SUBDIR points at a nonexistent dir so their own
+# CMakeLists aren't added (vulkan_app.cpp defines the *_IMPLEMENTATION macros).
+include(FetchContent)
+FetchContent_Declare(glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG 1.0.1
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_Declare(tinyobjloader
+  GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+  GIT_TAG v2.0.0rc13
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_MakeAvailable(glm tinyobjloader stb)
 
-function (add_slang_shader_target TARGET)
-  cmake_parse_arguments ("SHADER" "" "CHAPTER_NAME" "SOURCES" ${ARGN})
-  if(${CMAKE_GENERATOR} MATCHES "Visual Studio.*" OR 
-      ${CMAKE_GENERATOR} MATCHES "Ninja Multi-Config")
-    set (SHADERS_DIR ${CMAKE_BINARY_DIR}/${SHADER_CHAPTER_NAME}/$<CONFIG>/shaders)
-  else()
-    set (SHADERS_DIR ${CMAKE_BINARY_DIR}/${SHADER_CHAPTER_NAME}/shaders)
-  endif()
-  file(GLOB HAS_COMPUTE ${CHAPTER_SHADER}.comp)
-  set (ENTRY_POINTS -entry vertMain -entry fragMain)
-  if(HAS_COMPUTE)
-    list(APPEND ENTRY_POINTS -entry compMain)
-  endif()
-  add_custom_command (
-    OUTPUT ${SHADERS_DIR}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADERS_DIR}
-  )
-  add_custom_command (
-    OUTPUT  ${SHADERS_DIR}/slang.spv
-    COMMAND ${SLANGC_EXECUTABLE} ${SHADER_SOURCES} -target spirv -profile spirv_1_4+spvRayQueryKHR -emit-spirv-directly -fvk-use-entrypoint-name ${ENTRY_POINTS} -o slang.spv
-    WORKING_DIRECTORY ${SHADERS_DIR}
-    DEPENDS ${SHADER_SOURCES}
-    COMMENT "Compiling Slang Shaders for ${TARGET}"
-    VERBATIM
-  )
-  add_custom_target (${TARGET} DEPENDS ${SHADERS_DIR}/slang.spv)
-endfunction()
+# Runtime paths in vulkan_app.cpp are relative to the build/ directory.
+set(APP_NAME 28_steak_loading)
+set(APP_DIR ${CMAKE_BINARY_DIR}/${APP_NAME})
+set(ASSETS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../assets)
 
-function (add_chapter CHAPTER_NAME)
-  cmake_parse_arguments (CHAPTER "" "SHADER" "LIBS;TEXTURES;MODELS" ${ARGN})
-  add_executable (${CHAPTER_NAME} ${CHAPTER_NAME}.cpp)
-  set_target_properties (${CHAPTER_NAME} PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/${CHAPTER_NAME})
-  set_target_properties (${CHAPTER_NAME} PROPERTIES CXX_STANDARD 20)
-  target_link_libraries (${CHAPTER_NAME} Vulkan::cppm glfw)
-  target_include_directories (${CHAPTER_NAME} PRIVATE ${STB_INCLUDEDIR})
+set(SLANG_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/28_model_loading.slang)
+set(SLANG_SPV ${APP_DIR}/shaders/slang.spv)
+add_custom_command(
+  OUTPUT ${SLANG_SPV}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${APP_DIR}/shaders
+  COMMAND ${SLANGC_EXECUTABLE} ${SLANG_SRC}
+          -target spirv -profile spirv_1_4 -emit-spirv-directly
+          -fvk-use-entrypoint-name -entry vertMain -entry fragMain
+          -o ${SLANG_SPV}
+  DEPENDS ${SLANG_SRC}
+  COMMENT "Compiling Slang shaders for ${APP_NAME}"
+  VERBATIM)
+add_custom_target(${APP_NAME}_shaders DEPENDS ${SLANG_SPV})
 
-  # Add compile definition if C++ 20 module is enabled
-  if(ENABLE_CPP20_MODULE)
-    target_compile_definitions(${CHAPTER_NAME} PRIVATE USE_CPP20_MODULES=1)
-  endif()
+add_executable(${APP_NAME} vulkan_app.cpp)
+add_dependencies(${APP_NAME} ${APP_NAME}_shaders)
+set_target_properties(${APP_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${APP_DIR})
 
-  # Define VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS to treat VK_ERROR_OUT_OF_DATE_KHR as a success code
-  target_compile_definitions(${CHAPTER_NAME} PRIVATE "VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS" )
+target_include_directories(${APP_NAME} PRIVATE
+  ${glm_SOURCE_DIR}
+  ${tinyobjloader_SOURCE_DIR}
+  ${stb_SOURCE_DIR})
 
-  if(WIN32)
-    if(${CMAKE_GENERATOR} MATCHES "Visual Studio.*")
-      set_target_properties(${CHAPTER_NAME} PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}/${CHAPTER_NAME}")
-    endif()
-  endif()
+target_link_libraries(${APP_NAME} PRIVATE Vulkan::Vulkan glfw)
 
-  if (DEFINED CHAPTER_SHADER)
-    set (CHAPTER_SHADER_TARGET ${CHAPTER_NAME}_shader)
-    file (GLOB SHADER_SOURCES ${CHAPTER_SHADER}.frag ${CHAPTER_SHADER}.vert ${CHAPTER_SHADER}.comp)
-    add_shaders_target (${CHAPTER_SHADER_TARGET} CHAPTER_NAME ${CHAPTER_NAME} SOURCES ${SHADER_SOURCES})
-    add_dependencies (${CHAPTER_NAME} ${CHAPTER_SHADER_TARGET})
+target_compile_definitions(${APP_NAME} PRIVATE
+  VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
+  VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1
+  VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS)
 
-    set (CHAPTER_SHADER_SLANG_TARGET ${CHAPTER_NAME}_slang_shader)
-    file (GLOB SHADER_SLANG_SOURCES ${CHAPTER_SHADER}.slang)
-    if(SHADER_SLANG_SOURCES)
-      add_slang_shader_target( ${CHAPTER_SHADER_SLANG_TARGET} CHAPTER_NAME ${CHAPTER_NAME} SOURCES ${SHADER_SLANG_SOURCES})
-      add_dependencies(${CHAPTER_NAME} ${CHAPTER_SHADER_SLANG_TARGET})
-    endif()
-  endif ()
-  if (DEFINED CHAPTER_LIBS)
-    target_link_libraries (${CHAPTER_NAME} ${CHAPTER_LIBS})
-  endif ()
-  if (DEFINED CHAPTER_MODELS)
-    list(TRANSFORM CHAPTER_MODELS PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/assets/")
-    file (COPY ${CHAPTER_MODELS} DESTINATION ${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/models)
-    
-    if(${CMAKE_GENERATOR} MATCHES "Visual Studio.*" OR 
-      ${CMAKE_GENERATOR} MATCHES "Ninja Multi-Config")
-      sync_directory(
-        "${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/models"
-        "${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/$<CONFIG>/models"
-        ${CHAPTER_NAME}
-        "${CHAPTER_NAME} - Models"
-      )
-    endif()
-  endif ()
-  if (DEFINED CHAPTER_TEXTURES)
-    list(TRANSFORM CHAPTER_TEXTURES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/assets/")
-    file (COPY ${CHAPTER_TEXTURES} DESTINATION ${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/textures)
-
-    if(${CMAKE_GENERATOR} MATCHES "Visual Studio.*" OR 
-      ${CMAKE_GENERATOR} MATCHES "Ninja Multi-Config")
-      sync_directory(
-        "${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/textures"
-        "${CMAKE_BINARY_DIR}/${CHAPTER_NAME}/$<CONFIG>/textures"
-        ${CHAPTER_NAME}
-        "${CHAPTER_NAME} - Textures"
-      )  
-    endif()
-  endif ()
-endfunction ()
-
-function(sync_directory SRC_DIR DST_DIR TARGET_NAME LABEL)
-  add_custom_command(
-    TARGET ${TARGET_NAME}
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DST_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different "${SRC_DIR}" "${DST_DIR}"
-    COMMENT "${LABEL}: Syncing directory"
-  )
-endfunction()
-
-add_chapter (28_model_loading
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (28_steak_loading
-  SHADER shaders/28_model_loading
-  MODELS steak.obj
-  TEXTURES textureSteak.jpeg
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (29_mipmapping
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (30_multisampling
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (31_compute_shader
-  SHADER 31_shader_compute
-  LIBS glm::glm)
-
-add_chapter (32_ecosystem_utilities
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (33_vulkan_profiles
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (34_android
-  SHADER 27_shader_depth
-  MODELS viking_room.obj
-  TEXTURES viking_room.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
-
-add_chapter (35_gltf_ktx
-  SHADER 27_shader_depth
-  MODELS viking_room.glb
-  TEXTURES viking_room.ktx2
-  LIBS glm::glm tinygltf::tinygltf KTX::ktx)
-
-add_chapter (36_multiple_objects
-  SHADER 27_shader_depth
-  MODELS viking_room.glb
-  TEXTURES viking_room.ktx2
-  LIBS glm::glm tinygltf::tinygltf KTX::ktx)
-
-add_chapter (37_multithreading
-  SHADER 37_shader_compute
-  LIBS glm::glm)
-
-add_chapter (38_ray_tracing
-  SHADER 38_ray_tracing
-  MODELS plant_on_table.obj
-  MODELS plant_on_table.mtl
-  TEXTURES plant_on_table_textures/nettle_plant_diff_4k.png
-  TEXTURES plant_on_table_textures/potted_plant_02_pot_diff_1k.png
-  TEXTURES plant_on_table_textures/wooden_picnic_table_bottom_diff_1k.png
-  TEXTURES plant_on_table_textures/wooden_picnic_table_top_diff_1k.png
-  LIBS glm::glm tinyobjloader::tinyobjloader)
+file(COPY ${ASSETS_DIR}/models/steak.obj DESTINATION ${APP_DIR}/models)
+file(COPY ${ASSETS_DIR}/textures/textureSteak.jpeg DESTINATION ${APP_DIR}/textures)

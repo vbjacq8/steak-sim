@@ -831,7 +831,7 @@ private:
 
     void createGraphicsPipeline(){
         // path is relative to the working directory (usually build/)
-        shaderModule = createShaderModule(readFile("28_model_loading_me/shaders/slang.spv"));
+        shaderModule = createShaderModule(readFile("28_steak_loading/shaders/slang.spv"));
         vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = shaderModule, 
@@ -1290,8 +1290,9 @@ private:
                 return format;
             }
 
-            throw std::runtime_error("Failed to find supported format");
+            
         }
+        throw std::runtime_error("Failed to find supported format");
     }
 
     vk::Format findDepthFormat(){

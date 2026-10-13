@@ -1,12 +1,34 @@
-cmake_minimum_required(VERSION 3.18)
-project(steak-sim LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.29)
+project(steak-sim LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-option(STEAK_BUILD_CUDA "Build CUDA diffusion kernels" ON)
+option(STEAK_BUILD_RENDER "Build the Vulkan steak viewer (src/render)" ON)
+option(STEAK_BUILD_SIM "Build the steak_sim simulation + slice viewer" OFF)
+option(STEAK_BUILD_CUDA "Build CUDA diffusion kernels when a CUDA compiler is available" ON)
+
+if(STEAK_BUILD_RENDER)
+  add_subdirectory(src/render)
+endif()
+
+if(NOT STEAK_BUILD_SIM)
+  return()
+endif()
+
+if(STEAK_BUILD_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(CMAKE_CUDA_ARCHITECTURES 75)
+  else()
+    message(STATUS "No CUDA compiler found; building steak_sim without CUDA kernels")
+    set(STEAK_BUILD_CUDA OFF)
+  endif()
+endif()
 
 find_package(Vulkan REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -39,7 +61,6 @@ set(STEAK_SOURCES
 
 if(STEAK_BUILD_CUDA)
   list(APPEND STEAK_SOURCES src/sim/heat_diffusion.cu)
-  set(CMAKE_CUDA_ARCHITECTURES 75)
 endif()
 
 add_executable(steak_sim ${STEAK_SOURCES})
