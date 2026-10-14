@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Vulkan 1.4 REQUIRED)
 find_package(glfw3 REQUIRED)
+find_package(Open3D REQUIRED HINTS $ENV{HOME}/open3d_install/lib/cmake)
 find_program(SLANGC_EXECUTABLE slangc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
 
 # Header-only deps; SOURCE_SUBDIR points at a nonexistent dir so their own
@@ -56,7 +57,7 @@ target_include_directories(${APP_NAME} PRIVATE
   ${tinyobjloader_SOURCE_DIR}
   ${stb_SOURCE_DIR})
 
-target_link_libraries(${APP_NAME} PRIVATE Vulkan::Vulkan glfw)
+target_link_libraries(${APP_NAME} PRIVATE Vulkan::Vulkan glfw Open3D::Open3D)
 
 target_compile_definitions(${APP_NAME} PRIVATE
   VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
