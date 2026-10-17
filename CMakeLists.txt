@@ -5,87 +5,52 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(STEAK_BUILD_RENDER "Build the Vulkan steak viewer (src/render)" ON)
-option(STEAK_BUILD_SIM "Build the steak_sim simulation + slice viewer" OFF)
-option(STEAK_BUILD_CUDA "Build CUDA diffusion kernels when a CUDA compiler is available" ON)
+option(STEAK_BUILD_TESTS "Build unit tests" ON)
+
+find_package(Vulkan 1.4 REQUIRED)
+find_program(SLANGC_EXECUTABLE slangc HINTS $ENV{VULKAN_SDK}/bin REQUIRED)
+
+# Header-only deps; SOURCE_SUBDIR points at a nonexistent dir so their own
+# CMakeLists aren't added (vulkan_app.cpp defines the *_IMPLEMENTATION macros).
+include(FetchContent)
+FetchContent_Declare(glm
+  GIT_REPOSITORY https://github.com/g-truc/glm.git
+  GIT_TAG 1.0.1
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_Declare(tinyobjloader
+  GIT_REPOSITORY https://github.com/tinyobjloader/tinyobjloader.git
+  GIT_TAG v2.0.0rc13
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
+FetchContent_MakeAvailable(glm tinyobjloader stb)
+
+add_library(steak_third_party INTERFACE)
+target_include_directories(steak_third_party INTERFACE
+  ${glm_SOURCE_DIR}
+  ${tinyobjloader_SOURCE_DIR}
+  ${stb_SOURCE_DIR})
+
+# Runtime paths in vulkan_app.cpp are relative to the build/ directory.
+set(APP_NAME 28_steak_loading)
+set(APP_DIR ${CMAKE_BINARY_DIR}/${APP_NAME})
+set(APP_SHADER_DIR ${APP_DIR}/shaders)
+set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/src/assets)
+set(RENDER_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/render)
+set(COMPUTE_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/compute)
+
+add_subdirectory(src/sim)
 
 if(STEAK_BUILD_RENDER)
   add_subdirectory(src/render)
 endif()
 
-if(NOT STEAK_BUILD_SIM)
-  return()
+if(STEAK_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
 endif()
-
-if(STEAK_BUILD_CUDA)
-  include(CheckLanguage)
-  check_language(CUDA)
-  if(CMAKE_CUDA_COMPILER)
-    enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    set(CMAKE_CUDA_ARCHITECTURES 75)
-  else()
-    message(STATUS "No CUDA compiler found; building steak_sim without CUDA kernels")
-    set(STEAK_BUILD_CUDA OFF)
-  endif()
-endif()
-
-find_package(Vulkan REQUIRED)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(GLFW REQUIRED glfw3)
-find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
-
-set(SHADER_SOURCES
-  ${CMAKE_SOURCE_DIR}/shaders/slice.vert
-  ${CMAKE_SOURCE_DIR}/shaders/slice.frag
-)
-set(SHADER_SPV "")
-foreach(shader ${SHADER_SOURCES})
-  get_filename_component(shader_name ${shader} NAME)
-  set(spv ${CMAKE_BINARY_DIR}/shaders/${shader_name}.spv)
-  add_custom_command(
-    OUTPUT ${spv}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/shaders
-    COMMAND ${GLSLANG_VALIDATOR} -V ${shader} -o ${spv}
-    DEPENDS ${shader}
-    COMMENT "Compiling shader ${shader_name}"
-  )
-  list(APPEND SHADER_SPV ${spv})
-endforeach()
-add_custom_target(shaders DEPENDS ${SHADER_SPV})
-
-set(STEAK_SOURCES
-  src/main.cpp
-  src/render/vulkan_app.cpp
-)
-
-if(STEAK_BUILD_CUDA)
-  list(APPEND STEAK_SOURCES src/sim/heat_diffusion.cu)
-endif()
-
-add_executable(steak_sim ${STEAK_SOURCES})
-add_dependencies(steak_sim shaders)
-
-target_compile_definitions(steak_sim PRIVATE
-  STEAK_SHADER_DIR="${CMAKE_BINARY_DIR}/shaders"
-)
-
-target_include_directories(steak_sim PRIVATE
-  ${CMAKE_SOURCE_DIR}/src
-  ${Vulkan_INCLUDE_DIRS}
-  ${GLFW_INCLUDE_DIRS}
-)
-
-target_link_directories(steak_sim PRIVATE ${GLFW_LIBRARY_DIRS})
-
-target_link_libraries(steak_sim PRIVATE
-  Vulkan::Vulkan
-  ${GLFW_LIBRARIES}
-)
-
-target_compile_options(steak_sim PRIVATE
-  $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>
-)
-
-enable_testing()
-add_test(NAME verify COMMAND steak_sim --verify)

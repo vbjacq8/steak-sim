@@ -27,6 +27,8 @@ import vulkan_hpp;
 #define TINYOBJLOADER_IMPLEMENTATION
 #include<tiny_obj_loader.h>
 
+#include "voxelizer.hpp"
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
@@ -64,6 +66,8 @@ struct UniformBufferObject{
     alignas(16) glm::mat4 view;
     alignas(16) glm::mat4 proj;
 };
+
+constexpr float VOXEL_SIZE = 0.5f;
 
 /**  previous hard-coded vertex and index arrays for vulkan tutorial texture / depth load
 std::vector<Vertex> vertices = {
@@ -113,6 +117,7 @@ private:
         loadModel();
         createVertexBuffer();
         createIndexBuffer();
+        voxelizeModel();
         createUniformBuffers();
         createDescriptorPool();
         createDescriptorSets();
@@ -498,7 +503,7 @@ private:
         stagingBufferMemory.unmapMemory();
 
         std::tie(vertexBuffer, vertexBufferMemory) = 
-            createBuffer(bufferSize, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+            createBuffer(bufferSize, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
 
         copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
@@ -522,7 +527,7 @@ private:
         stagingBufferMemory.unmapMemory();
 
         std::tie(indexBuffer, indexBufferMemory) = 
-            createBuffer(bufferSize, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
+            createBuffer(bufferSize, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst, vk::MemoryPropertyFlagBits::eDeviceLocal);
 
 
         copyBuffer(stagingBuffer, indexBuffer, bufferSize);
@@ -548,6 +553,34 @@ private:
         vk::raii::CommandBuffer copyCommandBuffer = beginSingleTimeCommands();
         copyCommandBuffer.copyBuffer(*srcBuffer, *dstBuffer, vk::BufferCopy(0,0,size));
         endSingleTimeCommands(std::move(copyCommandBuffer));
+    }
+
+    // Runs shaders/compute/voxelize.slang over the loaded vertex/index buffers and reads the
+    // resulting VOXEL_* flags back into voxelGrid.
+    void voxelizeModel(){
+        glm::vec3 low(std::numeric_limits<float>::max());
+        glm::vec3 high(std::numeric_limits<float>::lowest());
+        for (const Vertex& vertex : vertices){
+            low = glm::min(low, vertex.pos);
+            high = glm::max(high, vertex.pos);
+        }
+
+        // path is relative to the working directory (usually build/)
+        Voxelizer voxelizer(device, physicalDevice, graphicsQueue, queueIndex, "28_steak_loading/shaders/voxelize.spv");
+        const uint32_t triangleCount = static_cast<uint32_t>(indices.size() / 3);
+        voxelGrid = voxelizer.voxelize(*vertexBuffer, sizeof(Vertex) / sizeof(float), *indexBuffer,
+                                       triangleCount, low, high, VOXEL_SIZE);
+
+        size_t inside = 0, surface = 0, solid = 0;
+        for (uint32_t cell : voxelGrid.cells){
+            inside += (cell & VOXEL_INSIDE) != 0;
+            surface += (cell & VOXEL_SURFACE) != 0;
+            solid += cell != 0;
+        }
+        std::cout << "Voxelized " << triangleCount << " triangles into "
+                  << voxelGrid.dims.x << "x" << voxelGrid.dims.y << "x" << voxelGrid.dims.z
+                  << " grid (voxel size " << voxelGrid.voxelSize << "): "
+                  << inside << " inside, " << surface << " surface, " << solid << " solid" << std::endl;
     }
 
     void mainLoop(){
@@ -1326,6 +1359,8 @@ private:
     std::vector<uint32_t> indices;
     vk::raii::Buffer indexBuffer = nullptr;
     vk::raii::DeviceMemory indexBufferMemory = nullptr;
+
+    VoxelGrid voxelGrid;
 
     std::vector<vk::raii::Buffer> uniformBuffers;
     std::vector<vk::raii::DeviceMemory> uniformBuffersMemory;
