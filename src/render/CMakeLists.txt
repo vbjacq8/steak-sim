@@ -24,5 +24,13 @@ target_link_libraries(${APP_NAME} PRIVATE steak_voxelizer glfw Open3D::Open3D)
 target_compile_definitions(${APP_NAME} PRIVATE
   VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS)
 
+# Standalone so it doesn't load Homebrew's GLFW alongside the copy bundled in Open3D.
+add_executable(voxel_viewer voxel_viewer.cpp)
+target_link_libraries(voxel_viewer PRIVATE steak_voxelizer Open3D::Open3D)
+target_compile_definitions(voxel_viewer PRIVATE
+  VOXELIZE_SPV="${STEAK_VOXELIZE_SPV}"
+  STEAK_OBJ="${ASSETS_DIR}/models/steak.obj"
+  OPEN3D_RESOURCE_DIR="${Open3D_DIR}/../../../share/resources")
+
 file(COPY ${ASSETS_DIR}/models/steak.obj DESTINATION ${APP_DIR}/models)
 file(COPY ${ASSETS_DIR}/textures/textureSteak.jpeg DESTINATION ${APP_DIR}/textures)

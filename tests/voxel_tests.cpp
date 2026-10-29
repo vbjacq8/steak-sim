@@ -1,3 +1,4 @@
+#include "compute_context.hpp"
 #include "voxelizer.hpp"
 
 #include <gtest/gtest.h>
@@ -24,69 +25,11 @@ static_assert(sizeof(Triangle) == 9 * sizeof(float));
 // Headless Vulkan
 // ---------------------------------------------------------------------------
 
-struct VulkanContext{
-    vk::raii::Context context;
-    vk::raii::Instance instance = nullptr;
-    vk::raii::PhysicalDevice physicalDevice = nullptr;
-    vk::raii::Device device = nullptr;
-    vk::raii::Queue queue = nullptr;
-    uint32_t queueFamily = 0;
-
-    VulkanContext(){
-        std::vector<const char*> instanceExtensions;
-        vk::InstanceCreateFlags instanceFlags{};
-        for (const auto& extension : context.enumerateInstanceExtensionProperties()){
-            // MoltenVK is only enumerated when portability enumeration is requested.
-            if (std::strcmp(extension.extensionName, vk::KHRPortabilityEnumerationExtensionName) == 0){
-                instanceExtensions.push_back(vk::KHRPortabilityEnumerationExtensionName);
-                instanceFlags |= vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR;
-            }
-        }
-        vk::ApplicationInfo appInfo{.pApplicationName = "voxel_tests", .apiVersion = vk::ApiVersion13};
-        instance = vk::raii::Instance(context, vk::InstanceCreateInfo{
-            .flags = instanceFlags,
-            .pApplicationInfo = &appInfo,
-            .enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size()),
-            .ppEnabledExtensionNames = instanceExtensions.data()});
-
-        for (auto& candidate : instance.enumeratePhysicalDevices()){
-            if (candidate.getProperties().apiVersion < vk::ApiVersion13) continue;
-            const auto families = candidate.getQueueFamilyProperties();
-            for (uint32_t i = 0; i < families.size(); ++i){
-                if (families[i].queueFlags & vk::QueueFlagBits::eCompute){
-                    physicalDevice = std::move(candidate);
-                    queueFamily = i;
-                    break;
-                }
-            }
-            if (*physicalDevice) break;
-        }
-        if (!*physicalDevice) throw std::runtime_error("no Vulkan 1.3 device with a compute queue");
-
-        std::vector<const char*> deviceExtensions;
-        for (const auto& extension : physicalDevice.enumerateDeviceExtensionProperties()){
-            if (std::strcmp(extension.extensionName, "VK_KHR_portability_subset") == 0){
-                deviceExtensions.push_back("VK_KHR_portability_subset");
-            }
-        }
-        const float priority = 1.0f;
-        vk::DeviceQueueCreateInfo queueInfo{.queueFamilyIndex = queueFamily, .queueCount = 1, .pQueuePriorities = &priority};
-        vk::PhysicalDeviceVulkan13Features features13{.synchronization2 = true};
-        device = vk::raii::Device(physicalDevice, vk::DeviceCreateInfo{
-            .pNext = &features13,
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &queueInfo,
-            .enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size()),
-            .ppEnabledExtensionNames = deviceExtensions.data()});
-        queue = vk::raii::Queue(device, queueFamily, 0);
-    }
-};
-
 // Shared by all tests; nullptr if no usable Vulkan device, in which case GPU tests skip.
-VulkanContext* vulkan(){
-    static std::unique_ptr<VulkanContext> ctx = []() -> std::unique_ptr<VulkanContext>{
+ComputeContext* vulkan(){
+    static std::unique_ptr<ComputeContext> ctx = []() -> std::unique_ptr<ComputeContext>{
         try{
-            return std::make_unique<VulkanContext>();
+            return std::make_unique<ComputeContext>("voxel_tests");
         } catch (const std::exception& e){
             std::cerr << "Vulkan unavailable: " << e.what() << std::endl;
             return nullptr;
@@ -104,7 +47,7 @@ struct HostBuffer{
     void* mapped = nullptr;
 };
 
-HostBuffer createHostBuffer(VulkanContext& ctx, vk::DeviceSize size){
+HostBuffer createHostBuffer(ComputeContext& ctx, vk::DeviceSize size){
     HostBuffer result;
     result.buffer = vk::raii::Buffer(ctx.device, vk::BufferCreateInfo{
         .size = size, .usage = vk::BufferUsageFlagBits::eStorageBuffer, .sharingMode = vk::SharingMode::eExclusive});
@@ -140,7 +83,7 @@ class TriangleKernel{
 public:
     enum Mode : uint32_t { TriangleBox = 0, RayCrossesUp = 1 };
 
-    explicit TriangleKernel(VulkanContext& ctx) : ctx(ctx){
+    explicit TriangleKernel(ComputeContext& ctx) : ctx(ctx){
         commandPool = vk::raii::CommandPool(ctx.device, vk::CommandPoolCreateInfo{.queueFamilyIndex = ctx.queueFamily});
 
         std::array<vk::DescriptorSetLayoutBinding, 2> bindings{};
@@ -226,7 +169,7 @@ public:
     }
 
 private:
-    VulkanContext& ctx;
+    ComputeContext& ctx;
     vk::raii::CommandPool commandPool = nullptr;
     vk::raii::DescriptorSetLayout setLayout = nullptr;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
@@ -385,7 +328,7 @@ glm::vec3 voxelCenter(const VoxelGrid& grid, uint32_t x, uint32_t y, uint32_t z)
 }
 
 Voxelizer makeVoxelizer(){
-    VulkanContext& ctx = *vulkan();
+    ComputeContext& ctx = *vulkan();
     return Voxelizer(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, VOXELIZE_SPV);
 }
 

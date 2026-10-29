@@ -13,7 +13,7 @@ add_custom_command(
 add_custom_target(steak_voxelizer_shaders DEPENDS ${VOXELIZE_SPV})
 set(STEAK_VOXELIZE_SPV ${VOXELIZE_SPV} PARENT_SCOPE)
 
-add_library(steak_voxelizer STATIC voxelizer.cpp)
+add_library(steak_voxelizer STATIC voxelizer.cpp compute_context.cpp)
 add_dependencies(steak_voxelizer steak_voxelizer_shaders)
 target_include_directories(steak_voxelizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(steak_voxelizer PUBLIC Vulkan::Vulkan steak_third_party)

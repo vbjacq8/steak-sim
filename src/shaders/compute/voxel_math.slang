@@ -2,7 +2,7 @@
 /**
  *\brief axis separation test used by the Akenine-Moller triangle/box overlap. 
  */
- 
+
 bool axisSeparates(float3 axis, float3 v0, float3 v1, float3 v2, float3 halfSize){
     //project the vertices onto the axis
     float p0 = dot(v0, axis);
@@ -24,7 +24,7 @@ bool planeBoxOverlap(float3 normal, float3 v0, float3 halfSize){
     //because we are working with the center being the origin, we can just take the projection of v0 onto the normal and that is the distance to the plane.
     float p0 = dot(v0, normal);
     float r= dot(halfSize, abs(normal));
-    return p0 > r || p0 < -r;
+    return abs(p0) <= r;
 }
 
 /**
@@ -44,14 +44,14 @@ bool triangleBoxOverlap(float3 a, float3 b, float3 c, float3 center, float3 half
     float3 basis[3] = {float3(1,0,0), float3(0,1,0), float3(0,0,1)};
     for (uint e = 0; e < 3; ++e){
         for (uint i = 0; i < 3; ++i){
-            if (axisSeparates(cross(basis[i], edges[2]), v0, v1, v2, halfSize)){
+            if (axisSeparates(cross(basis[i], edges[e]), v0, v1, v2, halfSize)){
                 return false;
             }
         }
     }
 
     //check bounding box overlap
-    if (any(min(v0, min(v1,v2)) > halfSize || any(max(v0,max(v1,v2)) < -halfSize))) return false;
+    if (any(min(v0, min(v1,v2)) > halfSize) || any(max(v0,max(v1,v2)) < -halfSize)) return false;
 
     //check overlap between triangle plane axis and voxel
     return planeBoxOverlap(cross(edges[0], edges[1]), v0, halfSize);
