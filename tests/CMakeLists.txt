@@ -7,10 +7,10 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
 set(TEST_SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/voxel_tests.slang)
-set(TEST_SHADER_SPV ${CMAKE_CURRENT_BINARY_DIR}/shaders/voxel_tests.spv)
+set(TEST_SHADER_SPV ${SHADER_OUTPUT_DIR}/voxel_tests.spv)
 add_custom_command(
   OUTPUT ${TEST_SHADER_SPV}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUTPUT_DIR}
   COMMAND ${SLANGC_EXECUTABLE} ${TEST_SHADER_SRC} -I ${COMPUTE_SHADER_DIR}
           -target spirv -profile spirv_1_4 -emit-spirv-directly
           -fvk-use-entrypoint-name -entry testMain
@@ -24,9 +24,8 @@ add_executable(voxel_tests voxel_tests.cpp)
 add_dependencies(voxel_tests voxel_test_shaders)
 target_link_libraries(voxel_tests PRIVATE steak_voxelizer GTest::gtest_main)
 target_compile_definitions(voxel_tests PRIVATE
-  VOXELIZE_SPV="${STEAK_VOXELIZE_SPV}"
   VOXEL_TESTS_SPV="${TEST_SHADER_SPV}"
-  STEAK_OBJ="${ASSETS_DIR}/models/steak.obj")
+  STEAK_OBJ="${STEAK_OBJ}")
 
 include(GoogleTest)
 gtest_discover_tests(voxel_tests DISCOVERY_TIMEOUT 60)

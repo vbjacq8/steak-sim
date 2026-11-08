@@ -1,60 +1,55 @@
 # steak-sim
 
-CUDA-accelerated 3D finite-difference heat diffusion for steak cooking, with Vulkan visualization.
+GPU heat diffusion for steak cooking, with Vulkan visualization.
 
-Each voxel stores a temperature. The simulator advances a 3D grid with an explicit finite-difference (FTCS) stencil. Temperature is mapped to color and rendered as a 2D slice today; the target architecture is a full 3D texture / volume ray-march in Vulkan.
+A steak mesh is voxelized on the GPU into a grid of inside/surface flags; that grid is the domain for a finite-difference heat simulation. Rendering and compute both run on Vulkan, with shaders written in Slang.
 
 ## Stack
 
-- **C++17** host code
-- **CUDA** for parallel diffusion steps (falls back to CPU when no GPU is present)
-- **Vulkan + GLFW** for real-time visualization
-- **CMake + Ninja** build system
+- **C++20** host code
+- **Vulkan 1.3+** for rendering and compute; **Slang** (`slangc`) for shaders
+- **GLFW** for the main window, **Open3D** for the voxel debug viewer
+- **CMake** build system, **GoogleTest** for tests
 
-## Prerequisites (Ubuntu)
+## Layout
 
-```bash
-sudo apt-get install -y \
-  build-essential ninja-build cmake pkg-config \
-  libvulkan-dev vulkan-tools vulkan-validationlayers mesa-vulkan-drivers \
-  glslang-tools spirv-tools \
-  libglfw3-dev libx11-dev \
-  nvidia-cuda-toolkit nvidia-cuda-toolkit-gcc
+```
+src/
+  assets/      one folder per asset, e.g. steak1/ (steak.obj + textureSteak.jpeg)
+  shaders/
+    render/    graphics shaders
+    compute/   compute shaders (voxelizer, heat diffusion)
+  sim/         simulation code: voxelizer, headless compute context
+  render/      steak_sim app and voxel_viewer
+tests/         GoogleTest suites and their test shaders
 ```
 
 ## Build
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+cmake -S . -B build
 cmake --build build -j
 ```
 
-## Run
+Executables are written directly to `build/`, compiled shaders to `build/shaders/`. Shader and asset paths are baked in at build time, so the executables can run from any directory.
 
-Headless verification (diffusion + Vulkan instance check):
+| Executable | Purpose |
+|------------|---------|
+| `build/steak_sim` | Main Vulkan app: renders the steak and voxelizes it |
+| `build/voxel_viewer [model.obj] [voxelSize]` | Draws the voxel grid as box outlines with a color key |
+| `build/voxel_tests` | Unit tests for the voxelizer and its shader math |
+
+Options: `-DSTEAK_ASSET=<folder>` picks which `src/assets/` folder is loaded (default `steak1`); `-DSTEAK_BUILD_RENDER=OFF` skips the GLFW/Open3D executables; `-DSTEAK_BUILD_TESTS=OFF` skips the tests.
+
+## Test
 
 ```bash
-./build/steak_sim --verify
+ctest --test-dir build
 ```
-
-Interactive Vulkan slice viewer (requires a display):
-
-```bash
-./build/steak_sim --grid 32 --steps 200
-```
-
-Options:
-
-| Flag | Description |
-|------|-------------|
-| `--verify` | Run diffusion + Vulkan checks, then exit |
-| `--headless` | Run diffusion only, no window |
-| `--grid N` | Cubic grid resolution `N³` (default 32) |
-| `--steps N` | Simulation steps / frames (default 100) |
 
 ## Roadmap
 
+- [ ] Finite-difference heat diffusion over the voxel grid
 - [ ] Volume ray-marching shader for full 3D steak texture
-- [ ] CUDA–Vulkan interop (export simulation buffer without host round-trip)
 - [ ] Steak albedo texture blended with temperature colormap
 - [ ] Boundary conditions for pan contact and ambient cooling

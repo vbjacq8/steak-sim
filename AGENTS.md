@@ -1,59 +1,39 @@
 # steak-sim
 
-Development notes for Cursor Cloud agents.
+Development notes for agents.
 
 ## Overview
 
-Single C++/CUDA/Vulkan executable (`steak_sim`). No databases or external services.
+C++20 + Vulkan project. No databases or external services.
 
 | Component | Purpose |
 |-----------|---------|
-| `steak_sim` | Host binary: simulation loop + Vulkan slice viewer |
-| CUDA kernels (`src/sim/heat_diffusion.cu`) | 3D FTCS diffusion on GPU |
-| Vulkan renderer (`src/render/vulkan_app.cpp`) | Temperature slice visualization |
+| `src/sim/` | `steak_voxelizer` library: GPU voxelizer and headless `ComputeContext` |
+| `src/render/vulkan_app.cpp` | `steak_sim`: GLFW/Vulkan app that renders and voxelizes the steak |
+| `src/render/voxel_viewer.cpp` | `voxel_viewer`: Open3D debug view of the voxel grid |
+| `src/shaders/{render,compute}/` | Slang shaders, compiled by `slangc` |
+| `tests/` | `voxel_tests` (GoogleTest) plus `voxel_tests.slang` |
 
 ## Build
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+cmake -S . -B build
 cmake --build build -j
 ```
 
-Use `g++` as the C++ compiler. `/usr/bin/c++` may point at Clang without a working `libstdc++` link on this image.
+- All executables are written to `build/`; compiled shaders to `build/shaders/*.spv`.
+- Shader and asset paths are compile-time absolute paths (`VOXELIZE_SPV`, `MODEL_SHADER_SPV`, `STEAK_OBJ`, ...), so binaries don't depend on the working directory.
+- Requires the Vulkan SDK (`slangc` is found via `$VULKAN_SDK/bin`). The render executables also need GLFW and Open3D (looked up in `~/open3d_install`); pass `-DSTEAK_BUILD_RENDER=OFF` to build only the library and tests.
 
-Shaders compile automatically via `glslangValidator` into `build/shaders/*.spv`.
-
-## Test / verify
+## Test
 
 ```bash
-./build/steak_sim --verify
 ctest --test-dir build
 ```
 
-`--verify` runs CPU or CUDA diffusion (whichever is available) and checks that Vulkan can create an instance and enumerate devices.
+GPU tests skip themselves if no Vulkan 1.3 device with a compute queue is available.
 
-## Run interactive viewer
+## Notes
 
-Requires `DISPLAY` (Cloud Agent VMs expose `:1`) and `XDG_RUNTIME_DIR`:
-
-```bash
-export DISPLAY=:1
-export XDG_RUNTIME_DIR=/tmp/xdg-runtime
-mkdir -p "$XDG_RUNTIME_DIR"
-./build/steak_sim --grid 32 --steps 100
-```
-
-## CUDA / GPU notes
-
-- **Compile**: `nvidia-cuda-toolkit` provides `nvcc` even without a GPU.
-- **Runtime**: CUDA kernels need an NVIDIA GPU. Cloud Agent VMs typically have **no GPU**; the code falls back to a CPU reference implementation automatically.
-- For local GPU development, ensure `nvidia-smi` reports a device; the binary will print `CUDA: <device name>` at startup.
-
-## Vulkan notes
-
-- Software rendering is available via Mesa Lavapipe (`lvp_icd.json`) if no discrete GPU is present.
-- `vulkaninfo` may fail on some headless setups even when GLFW + Vulkan rendering works through `DISPLAY=:1`.
-
-## Lint
-
-No project linter is configured yet. Build with `-Wall -Wextra -Wpedantic` is enabled for C++ sources in `CMakeLists.txt`.
+- Open3D bundles its own GLFW. Don't link Open3D and Homebrew GLFW into the same executable (macOS warns about duplicate classes and it can crash); `steak_sim` uses only GLFW, `voxel_viewer` only Open3D.
+- No linter is configured.

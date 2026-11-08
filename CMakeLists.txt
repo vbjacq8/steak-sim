@@ -36,11 +36,15 @@ target_include_directories(steak_third_party INTERFACE
   ${tinyobjloader_SOURCE_DIR}
   ${stb_SOURCE_DIR})
 
-# Runtime paths in vulkan_app.cpp are relative to the build/ directory.
-set(APP_NAME 28_steak_loading)
-set(APP_DIR ${CMAKE_BINARY_DIR}/${APP_NAME})
-set(APP_SHADER_DIR ${APP_DIR}/shaders)
+# Every executable lands directly in the build directory; compiled shaders go in build/shaders.
+# Executables get absolute shader/asset paths at compile time, so they run from any directory.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+set(SHADER_OUTPUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/src/assets)
+set(STEAK_ASSET "steak1" CACHE STRING "Asset folder under src/assets/ to load (holds steak.obj and textureSteak.jpeg)")
+set(STEAK_ASSET_DIR ${ASSETS_DIR}/${STEAK_ASSET})
+set(STEAK_OBJ ${STEAK_ASSET_DIR}/steak.obj)
+set(STEAK_TEXTURE ${STEAK_ASSET_DIR}/textureSteak.jpeg)
 set(RENDER_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/render)
 set(COMPUTE_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/compute)
 

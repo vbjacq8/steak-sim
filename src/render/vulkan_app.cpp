@@ -32,9 +32,8 @@ import vulkan_hpp;
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr uint32_t FRAMES_IN_FLIGHT = 2;
-//runtime constants; runtime occurs in build directory
-const std::string MODEL_PATH = "28_steak_loading/models/steak.obj";
-const std::string TEXTURE_PATH = "28_steak_loading/textures/textureSteak.jpeg";
+const std::string MODEL_PATH = STEAK_OBJ;
+const std::string TEXTURE_PATH = STEAK_TEXTURE;
 
 const std::vector<char const *>  validationLayers = {"VK_LAYER_KHRONOS_validation"};
 
@@ -565,8 +564,7 @@ private:
             high = glm::max(high, vertex.pos);
         }
 
-        // path is relative to the working directory (usually build/)
-        Voxelizer voxelizer(device, physicalDevice, graphicsQueue, queueIndex, "28_steak_loading/shaders/voxelize.spv");
+        Voxelizer voxelizer(device, physicalDevice, graphicsQueue, queueIndex, VOXELIZE_SPV);
         const uint32_t triangleCount = static_cast<uint32_t>(indices.size() / 3);
         voxelGrid = voxelizer.voxelize(*vertexBuffer, sizeof(Vertex) / sizeof(float), *indexBuffer,
                                        triangleCount, low, high, VOXEL_SIZE);
@@ -864,7 +862,7 @@ private:
 
     void createGraphicsPipeline(){
         // path is relative to the working directory (usually build/)
-        shaderModule = createShaderModule(readFile("28_steak_loading/shaders/slang.spv"));
+        shaderModule = createShaderModule(readFile(MODEL_SHADER_SPV));
         vk::PipelineShaderStageCreateInfo vertShaderStageInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = shaderModule, 
