@@ -1,74 +1,79 @@
-// Compute-shader finite difference temperature derivative solver
+// Compute-shader finite-difference step of the heat equation dT/dt = alpha * laplacian(T).
 //
-// Each thread owns one voxel and uses a finite difference stencil scheme to approximate the derivative
-// of temperature
+// Forward Euler in time, second-order 7-point Laplacian in space:
+//   T'[c] = T[c] + r * sum over the 6 neighbors n of w_n * (T[n] - T[c]),  r = alpha dt / dx^2
+// Each thread owns one cell and reads its neighbors straight from global memory. x is the fastest
+// index and the workgroup is 32 wide in x, so neighboring threads load neighboring floats.
+//
+// Every cell has a kind (see heat_solver.hpp), which sets the neighbor weight w_n:
+//   air    held at airTemp; heat crosses the air/meat face at h (T_air - T).  w = airCoupling
+//   solid  steps the heat equation.                                            w = 1
+//   pan    held at panTemp; heat crosses the pan/meat face at h (T_pan - T).  w = panCoupling
+// A neighbor outside the grid is the cell itself, so those faces are insulated too.
 
-import voxel_math;
+static const uint GROUP_X = 32;  // must match GROUP_SIZE in heat_solver.cpp
+static const uint GROUP_Y = 4;
+static const uint GROUP_Z = 2;
 
-static const uint GROUP_SIZE = 4;
+static const uint CELL_AIR = 0u;  // must match CELL_* in heat_solver.hpp
+static const uint CELL_SOLID = 1u;
+static const uint CELL_PAN = 2u;
 
-static const uint VOXEL_INSIDE = 1u;   // voxel center is inside the closed mesh
-static const uint VOXEL_SURFACE = 2u;  // voxel box touches at least one triangle
-
-// Must match VoxelizeParams in voxelizer.cpp.
-struct VoxelizeParams {
-    float3 origin;       // world position of the grid corner
-    float voxelSize;
-    uint3 dims;          // nx, ny, nz
-    uint triangleCount;
-    uint vertexStride;   // floats per vertex; position is the first three
+// Must match HeatStepParams in heat_solver.cpp.
+struct HeatStepParams {
+    uint3 dims;         // nx, ny, nz
+    float fourier;      // r = alpha * dt / dx^2
+    float panTemp;      // temperature of pan cells
+    float panCoupling;  // pan face conductance / cell face conductance, see HeatParams::panCoupling
+    float airTemp;      // temperature of air cells
+    float airCoupling;  // air face conductance / cell face conductance, see HeatParams::airCoupling
 };
-[[vk::push_constant]] ConstantBuffer<VoxelizeParams> params;
 
-[[vk::binding(0, 0)]] StructuredBuffer<float> vertexData;
-[[vk::binding(1, 0)]] StructuredBuffer<uint> indexData;
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> voxels;  // index = x + nx * (y + ny * z)
+[[vk::push_constant]] ConstantBuffer<HeatStepParams> params;
 
-float3 loadPosition(uint index) {
-    uint base = indexData[index] * params.vertexStride;
-    return float3(vertexData[base], vertexData[base + 1], vertexData[base + 2]);
+[[vk::binding(0, 0)]] StructuredBuffer<float> tempIn;     // index = x + nx * (y + ny * z)
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> tempOut;
+[[vk::binding(2, 0)]] StructuredBuffer<uint> cellKind;
+
+// w_n * (T[n] - T[c]) for neighbor j; j == i for a neighbor outside the grid.
+float faceFlux(uint j, float c) {
+    uint kind = cellKind[j];
+    float difference = tempIn[j] - c;
+    if (kind == CELL_AIR) return params.airCoupling * difference;
+    if (kind == CELL_PAN) return params.panCoupling * difference;
+    return difference;
 }
 
 [shader("compute")]
-[numthreads(GROUP_SIZE, GROUP_SIZE, GROUP_SIZE)]
-void voxelizeMain(uint3 voxel : SV_DispatchThreadID, uint3 group : SV_GroupID) {
-    if (any(voxel >= params.dims)) {
+[numthreads(GROUP_X, GROUP_Y, GROUP_Z)]
+void heatStepMain(uint3 cell : SV_DispatchThreadID) {
+    uint3 n = params.dims;
+    if (any(cell >= n)) {
+        return;
+    }
+    uint i = cell.x + n.x * (cell.y + n.y * cell.z);
+    uint kind = cellKind[i];
+    if (kind == CELL_PAN) {
+        tempOut[i] = params.panTemp;
+        return;
+    }
+    float c = tempIn[i];
+    if (kind == CELL_AIR) {
+        tempOut[i] = params.airTemp;
         return;
     }
 
-    float s = params.voxelSize;
-    float3 halfSize = 0.5 * s;
-    float3 center = params.origin + (float3(voxel) + 0.5) * s;
+    // Pick indices first so no load ever goes out of bounds.
+    uint strideY = n.x;
+    uint strideZ = n.x * n.y;
+    uint xm = cell.x > 0 ? i - 1 : i;
+    uint xp = cell.x + 1 < n.x ? i + 1 : i;
+    uint ym = cell.y > 0 ? i - strideY : i;
+    uint yp = cell.y + 1 < n.y ? i + strideY : i;
+    uint zm = cell.z > 0 ? i - strideZ : i;
+    uint zp = cell.z + 1 < n.z ? i + strideZ : i;
 
-    // Off-center so the ray never passes exactly through a shared edge or vertex,
-    // which would count one surface crossing twice and flip the parity.
-    float3 rayOrigin = center + float3(1.37e-4, 0.0, 2.91e-4) * s;
-
-    // Bounds of this workgroup's block. They are uniform across the group, so the
-    // culling branches below never diverge.
-    float3 blockMin = params.origin + float3(group * GROUP_SIZE) * s;
-    float3 blockMax = blockMin + GROUP_SIZE * s;
-
-    bool surface = false;
-    uint crossings = 0;
-    for (uint t = 0; t < params.triangleCount; ++t) {
-        float3 a = loadPosition(3 * t);
-        float3 b = loadPosition(3 * t + 1);
-        float3 c = loadPosition(3 * t + 2);
-        float3 triMin = min(a, min(b, c));
-        float3 triMax = max(a, max(b, c));
-
-        if (!surface && all(triMin <= blockMax) && all(triMax >= blockMin)) {
-            surface = triangleBoxOverlap(a, b, c, center, halfSize);
-        }
-
-        bool overFootprint = triMin.x <= blockMax.x && triMax.x >= blockMin.x &&
-                             triMin.z <= blockMax.z && triMax.z >= blockMin.z;
-        if (overFootprint && triMax.y > blockMin.y && rayCrossesUp(a, b, c, rayOrigin)) {
-            ++crossings;
-        }
-    }
-
-    uint flags = ((crossings & 1u) != 0u ? VOXEL_INSIDE : 0u) | (surface ? VOXEL_SURFACE : 0u);
-    voxels[voxel.x + params.dims.x * (voxel.y + params.dims.y * voxel.z)] = flags;
+    float flux = (faceFlux(xm, c) + faceFlux(xp, c)) + (faceFlux(ym, c) + faceFlux(yp, c)) +
+                 (faceFlux(zm, c) + faceFlux(zp, c));
+    tempOut[i] = c + params.fourier * flux;
 }

@@ -27,5 +27,9 @@ target_compile_definitions(voxel_tests PRIVATE
   VOXEL_TESTS_SPV="${TEST_SHADER_SPV}"
   STEAK_OBJ="${STEAK_OBJ}")
 
+add_executable(heat_tests heat_tests.cpp)
+target_link_libraries(heat_tests PRIVATE steak_voxelizer GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(voxel_tests DISCOVERY_TIMEOUT 60)
+gtest_discover_tests(heat_tests DISCOVERY_TIMEOUT 60)

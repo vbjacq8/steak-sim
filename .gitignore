@@ -219,5 +219,6 @@ __marimo__/
 
 # C++ / CMake
 build/
+cursor/
 cmake-build-*/
 *.spv

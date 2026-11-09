@@ -30,3 +30,16 @@ target_link_libraries(voxel_viewer PRIVATE steak_voxelizer Open3D::Open3D)
 target_compile_definitions(voxel_viewer PRIVATE
   STEAK_OBJ="${STEAK_OBJ}"
   OPEN3D_RESOURCE_DIR="${Open3D_DIR}/../../../share/resources")
+
+# Heat-map window shared by heat_viewer and steak_heat_demo.
+add_library(steak_heat_view STATIC heat_view.cpp)
+target_link_libraries(steak_heat_view PUBLIC steak_voxelizer Open3D::Open3D)
+target_compile_definitions(steak_heat_view PRIVATE
+  OPEN3D_RESOURCE_DIR="${Open3D_DIR}/../../../share/resources")
+
+add_executable(heat_viewer heat_viewer.cpp)
+target_link_libraries(heat_viewer PRIVATE steak_heat_view)
+
+add_executable(steak_heat_demo steak_heat_demo.cpp)
+target_link_libraries(steak_heat_demo PRIVATE steak_heat_view)
+target_compile_definitions(steak_heat_demo PRIVATE STEAK_OBJ="${STEAK_OBJ}")

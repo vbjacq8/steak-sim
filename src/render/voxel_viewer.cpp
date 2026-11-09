@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -73,6 +74,16 @@ void appendBox(open3d::geometry::LineSet& lines, Eigen::Vector3d lo, Eigen::Vect
         lines.lines_.emplace_back(base + a, base + b);
         lines.colors_.push_back(color);
     }
+}
+
+// Labels ignore SetBackgroundColor, so key swatches are solid-color images.
+std::shared_ptr<gui::ImageWidget> makeSwatch(const Eigen::Vector3d& color, int width, int height){
+    auto image = std::make_shared<open3d::geometry::Image>();
+    image->Prepare(width, height, 3, 1);
+    for (int i = 0; i < width * height; ++i){
+        for (int c = 0; c < 3; ++c) image->data_[3 * i + c] = static_cast<uint8_t>(std::lround(255.0 * color[c]));
+    }
+    return std::make_shared<gui::ImageWidget>(image);
 }
 
 // One toggleable group of geometry with a row in the key.
@@ -193,9 +204,7 @@ private:
             Layer& layer = layers[i];
             auto row = std::make_shared<gui::Horiz>(em / 2);
 
-            auto swatch = std::make_shared<gui::Label>("    ");
-            swatch->SetBackgroundColor(gui::Color(layer.color.x(), layer.color.y(), layer.color.z()));
-            row->AddChild(swatch);
+            row->AddChild(makeSwatch(layer.color, 2 * em, em));
 
             layer.checkbox = std::make_shared<gui::Checkbox>(layer.name.c_str());
             layer.checkbox->SetChecked(layer.visible);
