@@ -49,7 +49,20 @@ ctest --test-dir build
 
 ## Roadmap
 
-- [ ] Finite-difference heat diffusion over the voxel grid
+- [x] Finite-difference heat diffusion over the voxel grid
 - [ ] Volume ray-marching shader for full 3D steak texture
 - [ ] Steak albedo texture blended with temperature colormap
 - [ ] Boundary conditions for pan contact and ambient cooling
+
+## Samples
+Initial model load/render
+
+![Initial model](samples/initial-object.png)
+
+Model after conservative voxelization
+
+![Model after conservative voxelization](samples/voxelized-object.png)
+
+View of resulting heat simulation
+
+![Heat equation solver carried out on the resulting voxels](samples/heated-object.png)
