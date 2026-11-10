@@ -194,6 +194,20 @@ TEST(HeatSolver, AirGapBlocksHeat){
     for (uint32_t y = 3; y < 12; ++y) EXPECT_FLOAT_EQ(grid.at(4, y, 4), params.initialTemp) << "y = " << y;
 }
 
+// Batched submits used by the progress bar must finish on the same field as one submit.
+TEST(HeatSolver, ProgressBatchesMatchSingleSubmit){
+    REQUIRE_VULKAN();
+    const HeatParams params{.dims = {8, 8, 8}, .panTemp = 400.0f};
+    std::vector<float> seen;
+    const HeatGrid batched = gpu()->solver.run(params, 40, [&](float fraction){ seen.push_back(fraction); });
+    const HeatGrid once = gpu()->solver.run(params, 40);
+    ASSERT_FALSE(seen.empty());
+    EXPECT_GT(seen.front(), 0.0f);
+    EXPECT_FLOAT_EQ(seen.back(), 1.0f);
+    for (size_t i = 1; i < seen.size(); ++i) EXPECT_GE(seen[i], seen[i - 1]);
+    EXPECT_EQ(batched.temperature, once.temperature);
+}
+
 TEST(HeatSolver, RejectsUnstableTimeStep){
     REQUIRE_VULKAN();
     const HeatParams params{.dims = {8, 8, 8}, .spacing = 5.0e-4f, .timeStep = 1.0f};

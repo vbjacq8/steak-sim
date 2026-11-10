@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 
@@ -76,21 +77,22 @@ HeatSolver::HeatSolver(const vk::raii::Device& device, const vk::raii::PhysicalD
         .layout = pipelineLayout});
 }
 
-HeatGrid HeatSolver::run(const HeatParams& params, uint32_t steps){
-    return run(params, makeBlockCells(params.dims), steps);
+HeatGrid HeatSolver::run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress){
+    return run(params, makeBlockCells(params.dims), steps, progress);
 }
 
-HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps){
+HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps,
+                         const std::function<void(float)>& progress){
     std::vector<float> initial(cells.size(), params.initialTemp);
     for (size_t i = 0; i < cells.size(); ++i){
         if (cells[i] == CELL_PAN) initial[i] = params.panTemp;
         else if (cells[i] == CELL_AIR) initial[i] = params.airTemp;
     }
-    return run(params, cells, initial, steps);
+    return run(params, cells, initial, steps, progress);
 }
 
 HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, const std::vector<float>& initial,
-                         uint32_t steps){
+                         uint32_t steps, const std::function<void(float)>& progress){
     HeatGrid grid{.dims = params.dims, .spacing = params.spacing, .time = steps * params.timeStep, .cells = cells};
     if (grid.cellCount() == 0) throw std::invalid_argument("heat solver: empty grid");
     if (initial.size() != grid.cellCount()) throw std::invalid_argument("heat solver: initial field size != grid size");
@@ -154,45 +156,80 @@ HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& 
                                     .airCoupling = params.airCoupling()};
     const glm::uvec3 groups = (params.dims + GROUP_SIZE - 1u) / GROUP_SIZE;
     const vk::BufferCopy wholeBuffer{.size = bytes};
-
-    vk::raii::CommandBuffer commandBuffer = std::move(vk::raii::CommandBuffers(device, vk::CommandBufferAllocateInfo{
-        .commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1}).front());
-    commandBuffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-    commandBuffer.copyBuffer(*staging, *fields[0].first, wholeBuffer);
-    commandBuffer.copyBuffer(*staging, *cellBuffer, vk::BufferCopy{.srcOffset = bytes, .size = bytes});
-
     vk::MemoryBarrier2 uploadToCompute{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead};
-    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadToCompute});
-
-    commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
-    commandBuffer.pushConstants<HeatStepParams>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
     vk::MemoryBarrier2 betweenSteps{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
         .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite |
                          vk::AccessFlagBits2::eTransferRead};
-    for (uint32_t step = 0; step < steps; ++step){
-        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, *descriptorSets[step % 2], nullptr);
-        commandBuffer.dispatch(groups.x, groups.y, groups.z);
-        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &betweenSteps});
-    }
-
-    commandBuffer.copyBuffer(*fields[steps % 2].first, *staging, wholeBuffer);
     vk::MemoryBarrier2 toHost{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eHost,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead};
-    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
-    commandBuffer.end();
 
-    queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer}, nullptr);
-    queue.waitIdle();
+    auto beginCommands = [&](){
+        vk::raii::CommandBuffer commandBuffer = std::move(vk::raii::CommandBuffers(device, vk::CommandBufferAllocateInfo{
+            .commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1}).front());
+        commandBuffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+        return commandBuffer;
+    };
+    auto submit = [&](vk::raii::CommandBuffer& commandBuffer){
+        commandBuffer.end();
+        queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer}, nullptr);
+        queue.waitIdle();
+    };
+    auto recordUpload = [&](vk::raii::CommandBuffer& commandBuffer){
+        commandBuffer.copyBuffer(*staging, *fields[0].first, wholeBuffer);
+        commandBuffer.copyBuffer(*staging, *cellBuffer, vk::BufferCopy{.srcOffset = bytes, .size = bytes});
+        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadToCompute});
+    };
+    auto recordDispatches = [&](vk::raii::CommandBuffer& commandBuffer, uint32_t begin, uint32_t end){
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+        commandBuffer.pushConstants<HeatStepParams>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
+        for (uint32_t step = begin; step < end; ++step){
+            commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, *descriptorSets[step % 2], nullptr);
+            commandBuffer.dispatch(groups.x, groups.y, groups.z);
+            commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &betweenSteps});
+        }
+    };
+    auto recordReadback = [&](vk::raii::CommandBuffer& commandBuffer){
+        commandBuffer.copyBuffer(*fields[steps % 2].first, *staging, wholeBuffer);
+        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
+    };
+
+    // One submit keeps the steady-state path to a single queue wait. A progress callback submits in batches so the
+    // fraction can advance while the steps are actually running.
+    if (!progress || steps == 0){
+        vk::raii::CommandBuffer commandBuffer = beginCommands();
+        recordUpload(commandBuffer);
+        recordDispatches(commandBuffer, 0, steps);
+        recordReadback(commandBuffer);
+        submit(commandBuffer);
+    } else{
+        {
+            vk::raii::CommandBuffer commandBuffer = beginCommands();
+            recordUpload(commandBuffer);
+            submit(commandBuffer);
+        }
+        const uint32_t batches = std::min(steps, 32u);
+        const uint32_t batchSteps = (steps + batches - 1u) / batches;
+        for (uint32_t begin = 0; begin < steps; begin += batchSteps){
+            const uint32_t end = std::min(steps, begin + batchSteps);
+            vk::raii::CommandBuffer commandBuffer = beginCommands();
+            recordDispatches(commandBuffer, begin, end);
+            submit(commandBuffer);
+            progress(static_cast<float>(end) / static_cast<float>(steps));
+        }
+        vk::raii::CommandBuffer commandBuffer = beginCommands();
+        recordReadback(commandBuffer);
+        submit(commandBuffer);
+    }
 
     grid.temperature.resize(grid.cellCount());
     std::memcpy(grid.temperature.data(), stagingMemory.mapMemory(0, bytes), bytes);

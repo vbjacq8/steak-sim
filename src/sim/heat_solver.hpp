@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -16,7 +17,7 @@ constexpr uint32_t CELL_PAN = 2u;    // held at HeatParams::panTemp; exchanges h
 
 struct HeatParams{
     glm::uvec3 dims{128, 128, 128};
-    float spacing = 1.0e-3f;        // cell edge length dx, m
+    float spacing = 3.0e-3f;        // cell edge length dx, m
     float timeStep = 1.0f;          // dt, s
     float diffusivity = 1.3e-7f;    // alpha, m^2/s (lean beef)
     float conductivity = 0.47f;     // k, W/(m K) (lean beef)
@@ -77,15 +78,17 @@ public:
                const vk::raii::Queue& queue, uint32_t queueFamilyIndex, const std::string& shaderPath);
 
     // makeBlockCells(params.dims), starting from initialTemp with pan cells at panTemp and air cells at airTemp.
-    HeatGrid run(const HeatParams& params, uint32_t steps);
+    // `progress`, when set, is called with the fraction of steps finished (0, 1] after each batch of submits.
+    HeatGrid run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress = {});
 
     // `cells` holds a CELL_* kind per cell. Starts from initialTemp, with pan cells at panTemp and air cells at airTemp.
-    HeatGrid run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps);
+    HeatGrid run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps,
+                 const std::function<void(float)>& progress = {});
 
     // Starts from an arbitrary field (params.initialTemp is ignored). Pan cells become panTemp, and air cells
     // become airTemp, after the first step.
     HeatGrid run(const HeatParams& params, const std::vector<uint32_t>& cells, const std::vector<float>& initial,
-                 uint32_t steps);
+                 uint32_t steps, const std::function<void(float)>& progress = {});
 
 private:
     std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,

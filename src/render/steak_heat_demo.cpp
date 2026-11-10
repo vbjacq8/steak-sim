@@ -12,10 +12,14 @@
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -67,7 +71,26 @@ int main(int argc, char** argv){
                       << " ms\n";
         }
         printCenterColumn(result.heat, result.heat.dims.y);
-        showHeatGrid("steak heat demo: " + objPath, std::move(result.heat), params, steps);
+        const std::vector<glm::vec3> positions = mesh.positions;
+        const std::vector<uint32_t> indices = mesh.indices;
+        showHeatGrid(
+            "steak heat demo: " + objPath, std::move(result.heat), params, steps,
+            [positions, indices](const HeatParams& next, uint32_t nextSteps, const std::function<void(float)>& progress){
+                glm::vec3 low(std::numeric_limits<float>::infinity());
+                glm::vec3 high(-std::numeric_limits<float>::infinity());
+                for (const glm::vec3& point : positions){
+                    low = glm::min(low, point);
+                    high = glm::max(high, point);
+                }
+                const float voxelSize = next.spacing / METERS_PER_MODEL_UNIT;
+                const float extent = std::max({high.x - low.x, high.y - low.y, high.z - low.z});
+                if (!(voxelSize > 0.0f) || extent / voxelSize > 500.0f){
+                    throw std::invalid_argument("Cell size is too small; the grid would exceed 512 cells on a side.");
+                }
+                ComputeContext ctx("steak_heat_demo");
+                return simulateMeshHeat(ctx, positions, indices, METERS_PER_MODEL_UNIT, next, nextSteps, progress).heat;
+            },
+            true);
     } catch (const std::exception& e){
         std::cerr << "steak_heat_demo: " << e.what() << std::endl;
         return EXIT_FAILURE;

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 
 int main(){
@@ -26,7 +27,12 @@ int main(){
                       << grid.dims.x << "x" << grid.dims.y << "x" << grid.dims.z << " grid in " << elapsed.count() << " ms\n";
         }
         printCenterColumn(grid, 16);
-        showHeatGrid("heat viewer", std::move(grid), params, steps);
+        showHeatGrid("heat viewer", std::move(grid), params, steps,
+                     [](const HeatParams& next, uint32_t nextSteps, const std::function<void(float)>& progress){
+                         ComputeContext ctx("heat_viewer");
+                         HeatSolver solver(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, FINITE_DIFFERENCE_SPV);
+                         return solver.run(next, nextSteps, progress);
+                     });
     } catch (const std::exception& e){
         std::cerr << "heat_viewer: " << e.what() << std::endl;
         return EXIT_FAILURE;
