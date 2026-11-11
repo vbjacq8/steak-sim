@@ -53,8 +53,14 @@ struct HeatGrid{
     glm::uvec3 dims{};
     float spacing = 0.0f;
     float time = 0.0f;               // simulated seconds
-    std::vector<float> temperature;  // index = x + nx * (y + ny * z)
+    std::vector<float> temperature;  // degrees Fahrenheit; index = x + nx * (y + ny * z)
     std::vector<uint32_t> cells;     // CELL_* kinds the field was solved with, same indexing
+    // Linear sRGB from the color simulation, one entry per cell. Empty when color is not run;
+    // the viewer then keeps the temperature colors. Zero for cells that are not meat.
+    std::vector<glm::vec3> color;
+    // UV that seeded each cell from the albedo. (-1, -1) when the cell has none. Empty if color
+    // was not run. Same indexing as color.
+    std::vector<glm::vec2> sampleUv;
 
     size_t cellCount() const { return size_t(dims.x) * dims.y * dims.z; }
     size_t index(uint32_t x, uint32_t y, uint32_t z) const { return x + dims.x * (y + size_t(dims.y) * z); }
@@ -63,15 +69,30 @@ struct HeatGrid{
 };
 
 // Cell kinds for a grid that is CELL_SOLID where `solid` is nonzero (e.g. VoxelGrid::cells) and CELL_AIR
-// elsewhere, except that the whole y = 0 layer is the pan.
+// elsewhere, except that the whole z = 0 layer is the pan.
 std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid);
 
-// A grid that is solid everywhere, with the y = 0 layer as the pan.
+// A grid that is solid everywhere, with the z = 0 layer as the pan.
 std::vector<uint32_t> makeBlockCells(glm::uvec3 dims);
+
+// Optional GPU work recorded in the same command buffers as the heat steps.
+// prepare() runs after the ping-pong temperature buffers exist and before they are recorded.
+// recordInit() runs once the initial temperature is visible to compute. recordAfterStep() runs after
+// step `stepIndex` (0-based) has written its temperature; that temperature is in buffer (stepIndex + 1) % 2
+// of the pair passed to prepare(). recordReadback() runs after the last step. The queue is idle when run()
+// returns, so a buffer written by recordReadback can be mapped.
+class HeatStepHook{
+public:
+    virtual ~HeatStepHook() = default;
+    virtual void prepare(vk::Buffer temperature0, vk::Buffer temperature1) = 0;
+    virtual void recordInit(vk::raii::CommandBuffer& commandBuffer) = 0;
+    virtual void recordAfterStep(vk::raii::CommandBuffer& commandBuffer, uint32_t stepIndex) = 0;
+    virtual void recordReadback(vk::raii::CommandBuffer& commandBuffer) = 0;
+};
 
 // Runs shaders/compute/finitedifference.slang. The device, physical device and queue must outlive it.
 // Every run throws std::invalid_argument if params.fourier() > params.maxStableFourier() (unstable) or the inputs
-// don't match params.dims.
+// don't match params.dims. `hook`, when set, runs once per heat step after that step's temperature is visible.
 class HeatSolver{
 public:
     HeatSolver(const vk::raii::Device& device, const vk::raii::PhysicalDevice& physicalDevice,
@@ -79,16 +100,17 @@ public:
 
     // makeBlockCells(params.dims), starting from initialTemp with pan cells at panTemp and air cells at airTemp.
     // `progress`, when set, is called with the fraction of steps finished (0, 1] after each batch of submits.
-    HeatGrid run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress = {});
+    HeatGrid run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress = {},
+                 HeatStepHook* hook = nullptr);
 
     // `cells` holds a CELL_* kind per cell. Starts from initialTemp, with pan cells at panTemp and air cells at airTemp.
     HeatGrid run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps,
-                 const std::function<void(float)>& progress = {});
+                 const std::function<void(float)>& progress = {}, HeatStepHook* hook = nullptr);
 
     // Starts from an arbitrary field (params.initialTemp is ignored). Pan cells become panTemp, and air cells
     // become airTemp, after the first step.
     HeatGrid run(const HeatParams& params, const std::vector<uint32_t>& cells, const std::vector<float>& initial,
-                 uint32_t steps, const std::function<void(float)>& progress = {});
+                 uint32_t steps, const std::function<void(float)>& progress = {}, HeatStepHook* hook = nullptr);
 
 private:
     std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,

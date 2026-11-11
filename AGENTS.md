@@ -13,7 +13,7 @@ C++20 + Vulkan project. No databases or external services.
 | `src/render/voxel_viewer.cpp` | `voxel_viewer`: Open3D debug view of the voxel grid |
 | `src/render/heat_view.cpp` | `steak_heat_view` library: Open3D heat-map window shared by the heat executables |
 | `src/render/heat_viewer.cpp` | `heat_viewer`: heat sim on a solid block, shown in the heat-map window |
-| `src/render/steak_heat_demo.cpp` | `steak_heat_demo`: voxelizes the steak mesh, runs the heat sim on those voxels, shows it |
+| `src/render/steak_heat_demo.cpp` | `steak_heat_demo`: voxel heat and cooked color; toggles the temperature map, that texture, and the textured mesh |
 | `src/shaders/{render,compute}/` | Slang shaders, compiled by `slangc` |
 | `tests/` | `voxel_tests` and `heat_tests` (GoogleTest) plus `voxel_tests.slang` |
 

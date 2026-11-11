@@ -15,6 +15,29 @@ add_custom_command(
   VERBATIM)
 add_custom_target(steak_sim_shaders DEPENDS ${MODEL_SHADER_SPV})
 
+set(COLOR_SHADER_SRC ${RENDER_SHADER_DIR}/steak_color.slang)
+set(COLOR_SHADER_SPV ${SHADER_OUTPUT_DIR}/steak_color.spv)
+add_custom_command(
+  OUTPUT ${COLOR_SHADER_SPV}
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUTPUT_DIR}
+  COMMAND ${SLANGC_EXECUTABLE} ${COLOR_SHADER_SRC} -I ${COMPUTE_SHADER_DIR}
+          -target spirv -profile spirv_1_4 -emit-spirv-directly
+          -fvk-use-entrypoint-name -entry vertMain -entry fragMain
+          -o ${COLOR_SHADER_SPV}
+  DEPENDS ${COLOR_SHADER_SRC} ${COMPUTE_SHADER_DIR}/lab_color.slang
+  COMMENT "Compiling steak color mesh shader"
+  VERBATIM)
+add_custom_target(steak_color_shaders DEPENDS ${COLOR_SHADER_SPV})
+
+add_executable(steak_color_demo steak_color_demo.cpp)
+add_dependencies(steak_color_demo steak_color_shaders)
+target_link_libraries(steak_color_demo PRIVATE steak_voxelizer glfw)
+target_compile_definitions(steak_color_demo PRIVATE
+  VULKAN_HPP_HANDLE_ERROR_OUT_OF_DATE_AS_SUCCESS
+  COLOR_SHADER_SPV="${COLOR_SHADER_SPV}"
+  STEAK_OBJ="${STEAK_OBJ}"
+  STEAK_TEXTURE="${STEAK_TEXTURE}")
+
 add_executable(steak_sim vulkan_app.cpp)
 add_dependencies(steak_sim steak_sim_shaders)
 target_link_libraries(steak_sim PRIVATE steak_voxelizer glfw)
@@ -42,4 +65,6 @@ target_link_libraries(heat_viewer PRIVATE steak_heat_view)
 
 add_executable(steak_heat_demo steak_heat_demo.cpp)
 target_link_libraries(steak_heat_demo PRIVATE steak_heat_view)
-target_compile_definitions(steak_heat_demo PRIVATE STEAK_OBJ="${STEAK_OBJ}")
+target_compile_definitions(steak_heat_demo PRIVATE
+  STEAK_OBJ="${STEAK_OBJ}"
+  STEAK_TEXTURE="${STEAK_TEXTURE}")

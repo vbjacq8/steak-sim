@@ -2,7 +2,7 @@
 // The side panel is the color key, a reset button, and collapsible settings.
 // Typing in a box stores that value; the voxels rebuild when a reset finishes.
 //
-// Usage: voxel_viewer [model.obj] [voxelSize]
+// Usage: voxel_viewer [mesh.obj|mesh.gltf|mesh.glb] [voxelSize]
 //
 // Keys:
 //   1        toggle inside-only voxels      (flags == VOXEL_INSIDE)
@@ -14,12 +14,10 @@
 //   A          show all slices again
 
 #include "compute_context.hpp"
+#include "mesh_loader.hpp"
 #include "voxelizer.hpp"
 
 #include "reset_dialog.hpp"
-
-#define TINYOBJLOADER_IMPLEMENTATION
-#include <tiny_obj_loader.h>
 
 #include <open3d/Open3D.h>
 
@@ -45,28 +43,6 @@ constexpr double BOX_SHRINK = 0.85;
 constexpr double MAX_CELLS_PER_SIDE = 500.0;
 constexpr double MM_PER_MODEL_UNIT = 10.0;  // steak.obj is centimeters; the settings field is millimeters
 constexpr std::array<const char*, 3> AXIS_NAMES{"X", "Y", "Z"};
-
-struct Mesh{
-    std::vector<glm::vec3> positions;
-    std::vector<uint32_t> indices;
-};
-
-Mesh loadObj(const std::string& path){
-    tinyobj::attrib_t attrib;
-    std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
-    std::string warn, err;
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) throw std::runtime_error(warn + err);
-
-    Mesh mesh;
-    for (size_t i = 0; i + 2 < attrib.vertices.size(); i += 3){
-        mesh.positions.push_back({attrib.vertices[i], attrib.vertices[i + 1], attrib.vertices[i + 2]});
-    }
-    for (const auto& shape : shapes){
-        for (const auto& index : shape.mesh.indices) mesh.indices.push_back(static_cast<uint32_t>(index.vertex_index));
-    }
-    return mesh;
-}
 
 Eigen::Vector3d toEigen(glm::vec3 v){ return {v.x, v.y, v.z}; }
 
@@ -616,10 +592,20 @@ gui::FontId headingFont(){
 
 int main(int argc, char** argv){
     const std::string objPath = argc > 1 ? argv[1] : STEAK_OBJ;
-    const float voxelSize = argc > 2 ? std::strtof(argv[2], nullptr) : 0.5f;
+    float voxelSize = argc > 2 ? std::strtof(argv[2], nullptr) : 0.5f;
 
     try{
-        Mesh mesh = loadObj(objPath);
+        Mesh mesh = dropOverlappingParts(loadMesh(objPath));
+        if (argc <= 2 && !mesh.positions.empty()){
+            glm::vec3 low(std::numeric_limits<float>::infinity());
+            glm::vec3 high(-std::numeric_limits<float>::infinity());
+            for (const glm::vec3& point : mesh.positions){
+                low = glm::min(low, point);
+                high = glm::max(high, point);
+            }
+            const float extent = std::max({high.x - low.x, high.y - low.y, high.z - low.z});
+            if (voxelSize > 0.0f && extent / voxelSize > 200.0f) voxelSize = extent / 80.0f;
+        }
         VoxelGrid grid;
         {
             ComputeContext ctx("voxel_viewer");

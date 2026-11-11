@@ -43,9 +43,14 @@ ComputeContext::ComputeContext(const char* appName){
     }
     const float priority = 1.0f;
     vk::DeviceQueueCreateInfo queueInfo{.queueFamilyIndex = queueFamily, .queueCount = 1, .pQueuePriorities = &priority};
+    // RGBA16F storage images (the Lab volume) require shaderStorageImageExtendedFormats.
+    vk::PhysicalDeviceFeatures available = physicalDevice.getFeatures();
     vk::PhysicalDeviceVulkan13Features features13{.synchronization2 = true};
-    device = vk::raii::Device(physicalDevice, vk::DeviceCreateInfo{
+    vk::PhysicalDeviceFeatures2 features2{
         .pNext = &features13,
+        .features = {.shaderStorageImageExtendedFormats = available.shaderStorageImageExtendedFormats}};
+    device = vk::raii::Device(physicalDevice, vk::DeviceCreateInfo{
+        .pNext = &features2,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &queueInfo,
         .enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size()),

@@ -7,7 +7,11 @@
 
 #include "heat_view.hpp"
 
+#include "color_model.hpp"
 #include "reset_dialog.hpp"
+#include "voxelizer.hpp"
+
+#include <queue>
 
 #include <open3d/Open3D.h>
 #include <open3d/visualization/rendering/ColorGrading.h>
@@ -101,7 +105,7 @@ std::shared_ptr<gui::ImageWidget> makeSwatch(const Eigen::Vector3d& color, int w
 }
 
 void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, glm::uvec3 cell, int axis, bool positive,
-                float coldTemp, float hotTemp){
+                float coldTemp, float hotTemp, bool showCookedColor){
     const int u = (axis + 1) % 3;
     const int v = (axis + 2) % 3;
     const double s = grid.spacing * MM_PER_M;
@@ -115,8 +119,18 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
     const std::array<std::array<double, 2>, 4> corners{{{lo[u], lo[v]}, {hi[u], lo[v]}, {hi[u], hi[v]}, {lo[u], hi[v]}}};
 
     const int base = static_cast<int>(blocks.vertices_.size());
-    const double t = hotTemp > coldTemp ? (grid.at(cell.x, cell.y, cell.z) - coldTemp) / (hotTemp - coldTemp) : 1.0;
-    const Eigen::Vector3d color = heatColor(t).array().pow(2.2);
+    const bool meat = showCookedColor && grid.color.size() == grid.cellCount() && grid.kind(cell.x, cell.y, cell.z) == CELL_SOLID;
+    Eigen::Vector3d color;
+    if (meat){
+        // Already linear sRGB from the Lab export. The heat-map stops are display values and get
+        // linearized with pow(2.2); doing that again would darken the steak.
+        const glm::vec3 sample = grid.color[grid.index(cell.x, cell.y, cell.z)];
+        auto channel = [](float value){ return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
+        color = {channel(sample.x), channel(sample.y), channel(sample.z)};
+    } else{
+        const double t = hotTemp > coldTemp ? (grid.at(cell.x, cell.y, cell.z) - coldTemp) / (hotTemp - coldTemp) : 1.0;
+        color = heatColor(t).array().pow(2.2);
+    }
     for (const auto& [cu, cv] : corners){
         Eigen::Vector3d p;
         p[axis] = plane;
@@ -137,7 +151,7 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
 // Builds the block mesh for the current slice. Safe to call off the UI thread. `progress` is the fraction of
 // z-slices finished.
 open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis, int slice, bool showPan, float coldTemp,
-                                             float hotTemp, const std::function<void(float)>& progress){
+                                             float hotTemp, bool showCookedColor, const std::function<void(float)>& progress){
     glm::uvec3 regionLo(0);
     glm::uvec3 regionHi = grid.dims - 1u;
     if (slice >= 0){
@@ -164,7 +178,7 @@ open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis
                     for (int side : {-1, 1}){
                         glm::ivec3 neighbor = cell;
                         neighbor[axis] += side;
-                        if (!drawn(neighbor)) appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp);
+                        if (!drawn(neighbor)) appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp, showCookedColor);
                     }
                 }
             }
@@ -174,14 +188,243 @@ open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis
     return blocks;
 }
 
+bool hasSurface(const HeatSurface& surface){
+    return surface.metersPerUnit > 0.0f && !surface.positions.empty() && surface.indices.size() >= 3;
+}
+
+struct GridFrame{
+    glm::vec3 origin{};
+    float voxelSize = 1.0f;
+};
+
+// Same corner the voxelizer uses, so a model-space point lands in the cell the blocks draw for that index.
+GridFrame gridFrame(const HeatGrid& grid, const HeatSurface& surface){
+    glm::vec3 low(std::numeric_limits<float>::infinity());
+    glm::vec3 high(-std::numeric_limits<float>::infinity());
+    for (const glm::vec3& point : surface.positions){
+        low = glm::min(low, point);
+        high = glm::max(high, point);
+    }
+    const VoxelGrid layout = makeVoxelGridLayout(low, high, grid.spacing / surface.metersPerUnit);
+    return {layout.origin, layout.voxelSize};
+}
+
+Eigen::Vector3d sampleVoxel(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position, float coldTemp, float hotTemp,
+                            bool showCookedColor){
+    const glm::vec3 coord = (position - frame.origin) / frame.voxelSize - 0.5f;
+    const int x0 = static_cast<int>(std::floor(coord.x));
+    const int y0 = static_cast<int>(std::floor(coord.y));
+    const int z0 = static_cast<int>(std::floor(coord.z));
+    const float tx = coord.x - x0;
+    const float ty = coord.y - y0;
+    const float tz = coord.z - z0;
+    const bool cooked = showCookedColor && grid.color.size() == grid.cellCount();
+    float weight = 0.0f;
+    float temperature = 0.0f;
+    glm::vec3 color(0.0f);
+    for (int dz = 0; dz < 2; ++dz){
+        for (int dy = 0; dy < 2; ++dy){
+            for (int dx = 0; dx < 2; ++dx){
+                const int x = x0 + dx;
+                const int y = y0 + dy;
+                const int z = z0 + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= static_cast<int>(grid.dims.x) || y >= static_cast<int>(grid.dims.y) ||
+                    z >= static_cast<int>(grid.dims.z)){
+                    continue;
+                }
+                if (grid.kind(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)) != CELL_SOLID) continue;
+                const float w = (dx ? tx : 1.0f - tx) * (dy ? ty : 1.0f - ty) * (dz ? tz : 1.0f - tz);
+                weight += w;
+                temperature += w * grid.at(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z));
+                if (cooked) color += w * grid.color[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
+            }
+        }
+    }
+    if (!(weight > 1.0e-6f)){
+        const int x = std::clamp(static_cast<int>(std::lround(coord.x)), 0, static_cast<int>(grid.dims.x) - 1);
+        const int y = std::clamp(static_cast<int>(std::lround(coord.y)), 0, static_cast<int>(grid.dims.y) - 1);
+        const int z = std::clamp(static_cast<int>(std::lround(coord.z)), 0, static_cast<int>(grid.dims.z) - 1);
+        temperature = grid.at(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z));
+        if (cooked && grid.kind(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)) == CELL_SOLID){
+            color = grid.color[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
+            weight = 1.0f;
+        }
+    } else if (cooked){
+        color /= weight;
+        temperature /= weight;
+    } else{
+        temperature /= weight;
+    }
+    if (cooked && weight > 1.0e-6f){
+        auto channel = [](float value){ return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
+        return {channel(color.x), channel(color.y), channel(color.z)};
+    }
+    const double t = hotTemp > coldTemp ? (temperature - coldTemp) / (hotTemp - coldTemp) : 1.0;
+    return heatColor(t).array().pow(2.2);
+}
+
+bool hasAlbedo(const HeatSurface& surface){
+    return surface.width > 0 && surface.height > 0 &&
+           surface.rgba.size() == static_cast<size_t>(surface.width) * surface.height * 4 &&
+           surface.texcoords.size() == surface.positions.size();
+}
+
+std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
+    if (!hasAlbedo(surface)) return nullptr;
+    auto image = std::make_shared<open3d::geometry::Image>();
+    image->Prepare(surface.width, surface.height, 3, 1);
+    for (int y = 0; y < surface.height; ++y){
+        for (int x = 0; x < surface.width; ++x){
+            const size_t src = (static_cast<size_t>(y) * surface.width + x) * 4;
+            const size_t dst = (static_cast<size_t>(y) * surface.width + x) * 3;
+            image->data_[dst] = surface.rgba[src];
+            image->data_[dst + 1] = surface.rgba[src + 1];
+            image->data_[dst + 2] = surface.rgba[src + 2];
+        }
+    }
+    return image;
+}
+
+bool isSurfaceCell(const HeatGrid& grid, int x, int y, int z){
+    if (grid.kind(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)) != CELL_SOLID) return false;
+    const int offset[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    for (const auto& step : offset){
+        const int nx = x + step[0];
+        const int ny = y + step[1];
+        const int nz = z + step[2];
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= static_cast<int>(grid.dims.x) || ny >= static_cast<int>(grid.dims.y) ||
+            nz >= static_cast<int>(grid.dims.z) ||
+            grid.kind(static_cast<uint32_t>(nx), static_cast<uint32_t>(ny), static_cast<uint32_t>(nz)) != CELL_SOLID){
+            return true;
+        }
+    }
+    return false;
+}
+
+// Photo-resolution cook. Each surface voxel contributes its cooked a* at the texel it sampled.
+// L* and b* stay the albedo's, so marbling is not smeared across triangles.
+std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, const HeatSurface& surface){
+    auto image = makeAlbedo(surface);
+    if (!image || grid.color.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
+    const int width = surface.width;
+    const int height = surface.height;
+    const size_t texels = static_cast<size_t>(width) * height;
+    std::vector<float> aSum(texels, 0.0f);
+    std::vector<float> aWeight(texels, 0.0f);
+    for (int z = 0; z < static_cast<int>(grid.dims.z); ++z){
+        for (int y = 0; y < static_cast<int>(grid.dims.y); ++y){
+            for (int x = 0; x < static_cast<int>(grid.dims.x); ++x){
+                if (!isSurfaceCell(grid, x, y, z)) continue;
+                const glm::vec2 uv = grid.sampleUv[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
+                if (uv.x < 0.0f || uv.y < 0.0f || uv.x > 1.0f || uv.y > 1.0f) continue;
+                const int px = std::clamp(static_cast<int>(std::lround(uv.x * (width - 1))), 0, width - 1);
+                const int py = std::clamp(static_cast<int>(std::lround(uv.y * (height - 1))), 0, height - 1);
+                const size_t texel = static_cast<size_t>(py) * width + px;
+                aSum[texel] += linearSrgbToLab(grid.color[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))]).y;
+                aWeight[texel] += 1.0f;
+            }
+        }
+    }
+
+    constexpr int kMaxSpread = 64;
+    std::vector<int> distance(texels, kMaxSpread + 1);
+    std::vector<float> cookedA(texels, 0.0f);
+    std::queue<std::pair<int, int>> wave;
+    for (int y = 0; y < height; ++y){
+        for (int x = 0; x < width; ++x){
+            const size_t texel = static_cast<size_t>(y) * width + x;
+            if (!(aWeight[texel] > 0.0f)) continue;
+            distance[texel] = 0;
+            cookedA[texel] = aSum[texel] / aWeight[texel];
+            wave.emplace(x, y);
+        }
+    }
+    while (!wave.empty()){
+        const auto [x, y] = wave.front();
+        wave.pop();
+        const size_t texel = static_cast<size_t>(y) * width + x;
+        const int next = distance[texel] + 1;
+        if (next > kMaxSpread) continue;
+        const int neighbor[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (const auto& step : neighbor){
+            const int nx = x + step[0];
+            const int ny = y + step[1];
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            const size_t nextTexel = static_cast<size_t>(ny) * width + nx;
+            if (distance[nextTexel] <= next) continue;
+            distance[nextTexel] = next;
+            cookedA[nextTexel] = cookedA[texel];
+            wave.emplace(nx, ny);
+        }
+    }
+
+    for (size_t texel = 0; texel < texels; ++texel){
+        if (distance[texel] > kMaxSpread) continue;
+        const size_t byte = texel * 3;
+        const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
+        glm::vec3 lab = linearSrgbToLab(srgbToLinear(encoded));
+        lab.y = cookedA[texel];
+        const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
+        image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
+        image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));
+        image->data_[byte + 2] = static_cast<uint8_t>(std::lround(out.z * 255.0f));
+    }
+    return image;
+}
+
+// Textured mesh, the same surface steak_color_demo draws. Cooked color is a full-resolution
+// texture; vertex colors are only the fallback when the mesh has no albedo.
+open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const HeatSurface& surface, int sliceAxis, int slice,
+                                                float coldTemp, float hotTemp, bool showCookedColor){
+    open3d::geometry::TriangleMesh mesh;
+    if (!hasSurface(surface) || !(grid.spacing > 0.0f)) return mesh;
+    const GridFrame frame = gridFrame(grid, surface);
+    if (!(frame.voxelSize > 0.0f)) return mesh;
+    const double mmPerModel = grid.spacing * MM_PER_M / frame.voxelSize;
+    const bool textured = hasAlbedo(surface);
+    const auto cellOf = [&](glm::vec3 position){ return (position - frame.origin) / frame.voxelSize; };
+    const auto inSlice = [&](glm::vec3 position){
+        if (slice < 0) return true;
+        const float c = cellOf(position)[sliceAxis];
+        return c >= static_cast<float>(slice) && c < static_cast<float>(slice) + 1.0f;
+    };
+
+    std::vector<int> remap(surface.positions.size(), -1);
+    for (size_t t = 0; t + 2 < surface.indices.size(); t += 3){
+        const uint32_t ids[3] = {surface.indices[t], surface.indices[t + 1], surface.indices[t + 2]};
+        if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
+        if (!inSlice(surface.positions[ids[0]]) && !inSlice(surface.positions[ids[1]]) && !inSlice(surface.positions[ids[2]])) continue;
+        Eigen::Vector3i triangle;
+        for (int corner = 0; corner < 3; ++corner){
+            int& slot = remap[ids[corner]];
+            if (slot < 0){
+                const glm::vec3 position = surface.positions[ids[corner]];
+                const glm::vec3 placed = (position - frame.origin) * static_cast<float>(mmPerModel);
+                mesh.vertices_.emplace_back(placed.x, placed.y, placed.z);
+                if (!textured) mesh.vertex_colors_.push_back(sampleVoxel(grid, frame, position, coldTemp, hotTemp, showCookedColor));
+                slot = static_cast<int>(mesh.vertices_.size()) - 1;
+            }
+            triangle[corner] = slot;
+            if (textured){
+                const glm::vec2 uv = surface.texcoords[ids[corner]];
+                mesh.triangle_uvs_.emplace_back(uv.x, uv.y);
+            }
+        }
+        mesh.triangles_.push_back(triangle);
+    }
+    if (!mesh.triangles_.empty()) mesh.ComputeVertexNormals();
+    return mesh;
+}
+
 class HeatViewWindow : public gui::Window{
 public:
     HeatViewWindow(const std::string& title, HeatGrid gridIn, HeatParams paramsIn, uint32_t stepsIn, HeatSimulator simulateIn,
-                   bool gridFollowsMeshIn, gui::FontId headingFontIn)
+                   bool gridFollowsMeshIn, HeatSurface surfaceIn, gui::FontId headingFontIn)
         : gui::Window(title, 1400, 850),
           grid(std::move(gridIn)),
           edited(paramsIn),
           simulate(std::move(simulateIn)),
+          surface(std::move(surfaceIn)),
           editedSteps(stepsIn),
           gridFollowsMesh(gridFollowsMeshIn),
           headingFont(headingFontIn){
@@ -197,7 +440,11 @@ public:
         scene->GetScene()->GetView()->SetColorGrading(rendering::ColorGradingParams(
             rendering::ColorGradingParams::Quality::kHigh, rendering::ColorGradingParams::ToneMapping::kLinear));
         material.shader = "defaultUnlit";
-        rebuildBlocks();
+        textureMaterial.shader = "defaultUnlit";
+        albedoImage = makeAlbedo(surface);
+        textureMaterial.albedo_img = albedoImage;
+        textureMaterial.sRGB_color = true;
+        rebuildView();
 
         const auto& bounds = scene->GetScene()->GetBoundingBox();
         scene->SetupCamera(60.0f, bounds, bounds.GetCenter().cast<float>());
@@ -235,22 +482,40 @@ private:
             ++solidCells;
             minTemp = std::min(minTemp, grid.temperature[i]);
             maxTemp = std::max(maxTemp, grid.temperature[i]);
-            const size_t below = i - grid.dims.x;
-            if (i % (size_t(grid.dims.x) * grid.dims.y) >= grid.dims.x && grid.cells[below] == CELL_PAN) ++panContactCells;
+            const size_t slab = size_t(grid.dims.x) * grid.dims.y;
+            if (i >= slab && grid.cells[i - slab] == CELL_PAN) ++panContactCells;
         }
     }
 
-    void uploadBlocks(){
+    void ensureCookedAlbedo(){
+        if (cookedReady) return;
+        cookedAlbedo = bakeCookedAlbedo(grid, surface);
+        cookedReady = true;
+    }
+
+    void uploadView(){
         auto& scene3d = *scene->GetScene();
         if (scene3d.HasGeometry("blocks")) scene3d.RemoveGeometry("blocks");
-        if (!blocks.triangles_.empty()) scene3d.AddGeometry("blocks", &blocks, material, false);
+        if (scene3d.HasGeometry("surface")) scene3d.RemoveGeometry("surface");
+        if (showVolume || !hasSurface(surface)){
+            if (!blocks.triangles_.empty()) scene3d.AddGeometry("blocks", &blocks, material, false);
+        } else if (!surfaceDraw.triangles_.empty()){
+            if (showCookedColor && hasAlbedo(surface)) ensureCookedAlbedo();
+            const bool photo = textureMaterial.albedo_img != nullptr;
+            if (photo) textureMaterial.albedo_img = (showCookedColor && cookedAlbedo) ? cookedAlbedo : albedoImage;
+            scene3d.AddGeometry("surface", &surfaceDraw, photo ? textureMaterial : material, false);
+        }
         PostRedraw();
     }
 
-    void rebuildBlocks(){
+    void rebuildView(){
         if (resetting) return;
-        blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, {});
-        uploadBlocks();
+        if (showVolume || !hasSurface(surface)){
+            blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, {});
+        } else{
+            surfaceDraw = buildSurfaceMesh(grid, surface, sliceAxis, slice, coldTemp, hotTemp, showCookedColor);
+        }
+        uploadView();
     }
 
     void syncSliceControls(){
@@ -265,7 +530,7 @@ private:
     void setSlice(int newSlice){
         slice = std::clamp(newSlice, -1, static_cast<int>(grid.dims[sliceAxis]) - 1);
         syncSliceControls();
-        rebuildBlocks();
+        rebuildView();
     }
 
     void setSliceAxis(int axis){
@@ -286,13 +551,27 @@ private:
     void setColorMax(float value){
         hotTemp = value;
         updateLegend();
-        rebuildBlocks();
+        rebuildView();
     }
 
     void setShowPan(bool show){
         showPan = show;
         panCheckbox->SetChecked(show);
-        rebuildBlocks();
+        rebuildView();
+    }
+
+    void setShowCookedColor(bool show){
+        if (grid.color.size() != grid.cellCount() || showCookedColor == show) return;
+        showCookedColor = show;
+        if (colorCheckbox) colorCheckbox->SetChecked(show);
+        rebuildView();
+    }
+
+    void setShowVolume(bool show){
+        if (!hasSurface(surface) || showVolume == show) return;
+        showVolume = show;
+        if (volumeCheckbox) volumeCheckbox->SetChecked(show);
+        rebuildView();
     }
 
     void refreshFields(){
@@ -431,6 +710,18 @@ private:
         panCheckbox->SetChecked(showPan);
         panCheckbox->SetOnChecked([this](bool checked){ setShowPan(checked); });
         viewBody.AddChild(panCheckbox);
+        if (grid.color.size() == grid.cellCount()){
+            colorCheckbox = std::make_shared<gui::Checkbox>("Cooked color");
+            colorCheckbox->SetChecked(showCookedColor);
+            colorCheckbox->SetOnChecked([this](bool checked){ setShowCookedColor(checked); });
+            viewBody.AddChild(colorCheckbox);
+        }
+        if (hasSurface(surface)){
+            volumeCheckbox = std::make_shared<gui::Checkbox>("Voxel volume");
+            volumeCheckbox->SetChecked(showVolume);
+            volumeCheckbox->SetOnChecked([this](bool checked){ setShowVolume(checked); });
+            viewBody.AddChild(volumeCheckbox);
+        }
         singleSlice = std::make_shared<gui::Checkbox>("Single slice");
         singleSlice->SetOnChecked([this](bool checked){ setSlice(checked ? static_cast<int>(grid.dims[sliceAxis]) / 2 : -1); });
         viewBody.AddChild(singleSlice);
@@ -575,7 +866,10 @@ private:
         addField(meatBody, "Fourier r", false, [this](){ return format("%.4g", edited.fourier()); }, {});
         scroll->AddChild(meat);
 
-        auto help = std::make_shared<gui::Label>("Drag to rotate, scroll to zoom\n Press 'X', 'Y', 'Z' to take slices along axes and move them with the arrow keys\n Press 'A' to toggle back to the full domain. \n Press 'P' to toggle pan.");
+        std::string helpText = "Drag to rotate, scroll to zoom\n Press 'X', 'Y', 'Z' to take slices along axes and move them with the arrow keys\n Press 'A' to toggle back to the full domain. \n Press 'P' to toggle pan.";
+        if (grid.color.size() == grid.cellCount()) helpText += "\n Press 'C' to toggle cooked color.";
+        if (hasSurface(surface)) helpText += "\n Press 'V' to toggle the voxel volume and the mesh.";
+        auto help = std::make_shared<gui::Label>(helpText.c_str());
         help->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
         scroll->AddChild(help);
         panel->AddChild(scroll);
@@ -616,11 +910,12 @@ private:
         const int axis = sliceAxis;
         const int sliceNow = slice;
         const bool pan = showPan;
+        const bool cooked = showCookedColor;
         const float cold = coldTemp;
         const float hot = hotTemp;
         auto dialog = progressDialog;
         auto simulator = simulate;
-        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cold, hot, simulator](){
+        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cooked, cold, hot, simulator](){
             int lastPercent = -1;
             auto report = [this, dialog, &lastPercent](float fraction){
                 const int percent = std::clamp(static_cast<int>(std::lround(fraction * 100.0f)), 0, 100);
@@ -632,7 +927,7 @@ private:
                 report(0.01f);
                 HeatGrid next = simulator(ran, ranSteps, [&](float fraction){ report(0.02f + 0.78f * fraction); });
                 auto mesh = std::make_shared<open3d::geometry::TriangleMesh>(
-                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
+                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, cooked, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
                 auto gridPtr = std::make_shared<HeatGrid>(std::move(next));
                 auto applied = std::make_shared<HeatParams>(ran);
                 gui::Application::GetInstance().PostToMainThread(
@@ -661,7 +956,12 @@ private:
         sliceAxis = axis;
         slice = sliceNow < 0 ? -1 : std::min(sliceNow, std::max(0, static_cast<int>(grid.dims[sliceAxis]) - 1));
         blocks = std::move(mesh);
-        uploadBlocks();
+        cookedReady = false;
+        cookedAlbedo.reset();
+        if (!showVolume && hasSurface(surface)){
+            surfaceDraw = buildSurfaceMesh(grid, surface, sliceAxis, slice, coldTemp, hotTemp, showCookedColor);
+        }
+        uploadView();
         if (shapeChanged && !blocks.triangles_.empty()){
             const auto& bounds = scene->GetScene()->GetBoundingBox();
             scene->SetupCamera(60.0f, bounds, bounds.GetCenter().cast<float>());
@@ -702,6 +1002,8 @@ private:
             case gui::KEY_DOWN: setSlice(slice < 0 ? middle : std::max(slice - 1, 0)); return true;
             case gui::KEY_A: setSlice(-1); return true;
             case gui::KEY_P: setShowPan(!showPan); return true;
+            case gui::KEY_C: setShowCookedColor(!showCookedColor); return true;
+            case gui::KEY_V: setShowVolume(!showVolume); return true;
             default: return false;
         }
     }
@@ -709,6 +1011,7 @@ private:
     HeatGrid grid;
     HeatParams edited;
     HeatSimulator simulate;
+    HeatSurface surface;
     uint32_t editedSteps = 0;
     bool gridFollowsMesh = false;
     gui::FontId headingFont = 0;
@@ -718,15 +1021,24 @@ private:
     int sliceAxis = 2;
     int slice = -1;
     bool showPan = true;
+    bool showCookedColor = false;
+    bool showVolume = true;
     bool resetting = false;
     bool progressArmed = false;
     double progressDoneAt = 0.0;
     open3d::geometry::TriangleMesh blocks;
+    open3d::geometry::TriangleMesh surfaceDraw;
     rendering::MaterialRecord material;
+    rendering::MaterialRecord textureMaterial;
+    std::shared_ptr<open3d::geometry::Image> albedoImage;
+    std::shared_ptr<open3d::geometry::Image> cookedAlbedo;
+    bool cookedReady = false;
     std::shared_ptr<gui::SceneWidget> scene;
     std::shared_ptr<gui::Vert> panel;
     std::array<std::shared_ptr<gui::Label>, LEGEND_ROWS> legendLabels;
     std::shared_ptr<gui::Checkbox> panCheckbox;
+    std::shared_ptr<gui::Checkbox> colorCheckbox;
+    std::shared_ptr<gui::Checkbox> volumeCheckbox;
     std::shared_ptr<gui::Label> axisLabel;
     std::shared_ptr<gui::Combobox> axisCombo;
     std::shared_ptr<gui::Checkbox> singleSlice;
@@ -748,21 +1060,22 @@ gui::FontId headingFont(){
 }  // namespace
 
 void printCenterColumn(const HeatGrid& grid, uint32_t rows){
-    const uint32_t cx = grid.dims.x / 2, cz = grid.dims.z / 2;
+    const uint32_t cx = grid.dims.x / 2, cy = grid.dims.y / 2;
     std::cout << "Temperature up the center column at t = " << grid.time << " s:\n";
-    for (uint32_t y = 0; y < std::min(grid.dims.y, rows); ++y){
-        const uint32_t kind = grid.kind(cx, y, cz);
-        std::cout << "  y = " << format("%5.1f", y * grid.spacing * MM_PER_M) << " mm: " << format("%6.1f", grid.at(cx, y, cz)) << " F"
+    for (uint32_t z = 0; z < std::min(grid.dims.z, rows); ++z){
+        const uint32_t kind = grid.kind(cx, cy, z);
+        std::cout << "  z = " << format("%5.1f", z * grid.spacing * MM_PER_M) << " mm: " << format("%6.1f", grid.at(cx, cy, z)) << " F"
                   << (kind == CELL_PAN ? "  (pan)" : kind == CELL_AIR ? "  (air)" : "") << "\n";
     }
     std::cout << std::flush;
 }
 
 void showHeatGrid(const std::string& title, HeatGrid grid, const HeatParams& params, uint32_t steps, HeatSimulator simulate,
-                  bool gridFollowsMesh){
+                  bool gridFollowsMesh, HeatSurface surface){
     auto& app = gui::Application::GetInstance();
     app.Initialize(OPEN3D_RESOURCE_DIR);
     const gui::FontId font = headingFont();
-    app.AddWindow(std::make_shared<HeatViewWindow>(title, std::move(grid), params, steps, std::move(simulate), gridFollowsMesh, font));
+    app.AddWindow(std::make_shared<HeatViewWindow>(title, std::move(grid), params, steps, std::move(simulate), gridFollowsMesh,
+                                                   std::move(surface), font));
     app.Run();
 }

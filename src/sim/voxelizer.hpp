@@ -16,6 +16,11 @@ struct VoxelGrid{
     float voxelSize = 0.0f;
     glm::uvec3 dims{};
     std::vector<uint32_t> cells;  // VOXEL_* flags; index = x + nx * (y + ny * z)
+    // One UV per cell when voxelize() is given texcoords; empty otherwise.
+    // Occupied voxels store the barycentric UV of the closest point on the mesh. Interior voxels have
+    // no triangle of their own, so they inherit that nearest surface UV and the crust color bleeds
+    // inward. Empty voxels are (-1, -1). A voxel position is not used as a texture coordinate.
+    std::vector<glm::vec2> uv;
 
     size_t cellCount() const { return size_t(dims.x) * dims.y * dims.z; }
     uint32_t at(uint32_t x, uint32_t y, uint32_t z) const { return cells[x + dims.x * (y + dims.y * z)]; }
@@ -32,13 +37,19 @@ public:
               const vk::raii::Queue& queue, uint32_t queueFamilyIndex, const std::string& shaderPath);
 
     // Triangles already on the GPU; each vertex's position is its first three floats.
-    // Both buffers need eStorageBuffer usage.
+    // Both buffers need eStorageBuffer usage. Pass `texcoords` (one float2 per vertex, same index as
+    // positions) to fill VoxelGrid::uv; a null buffer leaves uv empty and skips that work.
     VoxelGrid voxelize(vk::Buffer vertexBuffer, uint32_t vertexStrideFloats, vk::Buffer indexBuffer,
-                       uint32_t triangleCount, glm::vec3 low, glm::vec3 high, float voxelSize);
+                       uint32_t triangleCount, glm::vec3 low, glm::vec3 high, float voxelSize,
+                       vk::Buffer texcoords = {}, uint32_t texcoordCount = 0);
 
     // Uploads the mesh to the GPU, then voxelizes it.
     VoxelGrid voxelize(const std::vector<glm::vec3>& positions, const std::vector<uint32_t>& indices,
                        float voxelSize);
+
+    // `texcoords` is one UV per position. See VoxelGrid::uv for how interior voxels get a color.
+    VoxelGrid voxelize(const std::vector<glm::vec3>& positions, const std::vector<glm::vec2>& texcoords,
+                       const std::vector<uint32_t>& indices, float voxelSize);
 
 private:
     std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createHostBuffer(vk::DeviceSize size,

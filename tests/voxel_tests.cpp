@@ -1,20 +1,23 @@
 #include "compute_context.hpp"
+#include "mesh_loader.hpp"
 #include "voxelizer.hpp"
 
 #include <gtest/gtest.h>
-
-#define TINYOBJLOADER_IMPLEMENTATION
-#include <tiny_obj_loader.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <optional>
 #include <random>
+#include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -245,11 +248,6 @@ std::vector<Triangle> randomTriangles(size_t count, uint32_t seed){
 // Meshes
 // ---------------------------------------------------------------------------
 
-struct Mesh{
-    std::vector<glm::vec3> positions;
-    std::vector<uint32_t> indices;
-};
-
 Mesh boxMesh(glm::vec3 lo, glm::vec3 hi){
     Mesh mesh;
     for (uint32_t i = 0; i < 8; ++i){
@@ -286,23 +284,6 @@ Mesh uvSphere(float radius, uint32_t stacks, uint32_t slices){
             const uint32_t a = ring(i, j), b = ring(i, j + 1), c = ring(i + 1, j + 1), d = ring(i + 1, j);
             mesh.indices.insert(mesh.indices.end(), {a, b, c, a, c, d});
         }
-    }
-    return mesh;
-}
-
-Mesh loadObj(const std::string& path){
-    tinyobj::attrib_t attrib;
-    std::vector<tinyobj::shape_t> shapes;
-    std::vector<tinyobj::material_t> materials;
-    std::string warn, err;
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) throw std::runtime_error(warn + err);
-
-    Mesh mesh;
-    for (size_t i = 0; i + 2 < attrib.vertices.size(); i += 3){
-        mesh.positions.push_back({attrib.vertices[i], attrib.vertices[i + 1], attrib.vertices[i + 2]});
-    }
-    for (const auto& shape : shapes){
-        for (const auto& index : shape.mesh.indices) mesh.indices.push_back(static_cast<uint32_t>(index.vertex_index));
     }
     return mesh;
 }
@@ -593,12 +574,214 @@ TEST(Voxelizer, SurfaceHasNoGapsBetweenInsideAndOutside){
 TEST(Voxelizer, SteakInsideMatchesMeshVolume){
     REQUIRE_VULKAN();
     Voxelizer voxelizer = makeVoxelizer();
-    const Mesh steak = loadObj(STEAK_OBJ);
+    const Mesh steak = loadMesh(STEAK_OBJ);
     const VoxelGrid grid = voxelizer.voxelize(steak.positions, steak.indices, 0.5f);
 
     EXPECT_EQ(grid.dims, glm::uvec3(68, 13, 41));
     const double insideVolume = double(countFlag(grid, VOXEL_INSIDE)) * std::pow(double(grid.voxelSize), 3);
     EXPECT_NEAR(insideVolume, meshVolume(steak), 0.02 * meshVolume(steak));
+}
+
+// Closest-point UVs. Interior voxels have no triangle, so they inherit the nearest surface UV.
+TEST(Voxelizer, OccupiedVoxelsTakeNearestTriangleUv){
+    REQUIRE_VULKAN();
+    Voxelizer voxelizer = makeVoxelizer();
+    const std::vector<glm::vec3> positions{{0.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f}, {0.0f, 2.0f, 0.0f}};
+    const std::vector<glm::vec2> uvs{{0.0f, 0.0f}, {1.0f, 0.0f}, {0.0f, 1.0f}};
+    const std::vector<uint32_t> indices{0, 1, 2};
+    const VoxelGrid plain = voxelizer.voxelize(positions, indices, 1.0f);
+    const VoxelGrid grid = voxelizer.voxelize(positions, uvs, indices, 1.0f);
+
+    EXPECT_TRUE(plain.uv.empty());
+    ASSERT_EQ(grid.cells, plain.cells);
+    ASSERT_EQ(grid.uv.size(), grid.cellCount());
+
+    bool found = false;
+    for (uint32_t z = 0; z < grid.dims.z; ++z){
+        for (uint32_t y = 0; y < grid.dims.y; ++y){
+            for (uint32_t x = 0; x < grid.dims.x; ++x){
+                const size_t i = x + size_t(grid.dims.x) * (y + size_t(grid.dims.y) * z);
+                if (grid.at(x, y, z) == 0){
+                    EXPECT_EQ(grid.uv[i], glm::vec2(-1.0f, -1.0f));
+                    continue;
+                }
+                const glm::vec3 center = voxelCenter(grid, x, y, z);
+                if (glm::distance(center, glm::vec3(0.5f, 0.5f, -0.5f)) < 1e-4f){
+                    found = true;
+                    EXPECT_NEAR(grid.uv[i].x, 0.25f, 1e-3f);
+                    EXPECT_NEAR(grid.uv[i].y, 0.25f, 1e-3f);
+                }
+            }
+        }
+    }
+    EXPECT_TRUE(found);
+
+    const Mesh box = boxMesh(glm::vec3(0.05f), glm::vec3(0.95f));
+    const std::vector<glm::vec2> boxUv(box.positions.size(), glm::vec2(0.3f, 0.7f));
+    const VoxelGrid colored = voxelizer.voxelize(box.positions, boxUv, box.indices, 0.25f);
+    const VoxelGrid bare = voxelizer.voxelize(box.positions, box.indices, 0.25f);
+    ASSERT_EQ(colored.cells, bare.cells);
+    size_t interior = 0;
+    for (size_t i = 0; i < colored.cellCount(); ++i){
+        if (colored.cells[i] == 0){
+            EXPECT_EQ(colored.uv[i], glm::vec2(-1.0f, -1.0f));
+        } else{
+            EXPECT_NEAR(colored.uv[i].x, 0.3f, 1e-3f);
+            EXPECT_NEAR(colored.uv[i].y, 0.7f, 1e-3f);
+            if ((colored.cells[i] & VOXEL_INSIDE) != 0 && (colored.cells[i] & VOXEL_SURFACE) == 0) ++interior;
+        }
+    }
+    EXPECT_GT(interior, 0u);
+}
+
+std::filesystem::path meshTestDir(const char* name){
+    const auto dir = std::filesystem::temp_directory_path() / "steak-sim-mesh-loader" / name;
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    return dir;
+}
+
+void writeBytes(const std::filesystem::path& path, const void* data, size_t size){
+    std::ofstream out(path, std::ios::binary);
+    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    if (!out) throw std::runtime_error("failed to write " + path.string());
+}
+
+// Positions, texcoords, then uint16 indices, padded to 4 bytes. JSON names the bin "mesh.bin".
+std::vector<unsigned char> triangleBin(){
+    const float pos[] = {0, 0, 0, 1, 0, 0, 0, 1, 0};
+    const float uv[] = {0, 0, 1, 0, 0, 1};
+    const uint16_t idx[] = {0, 1, 2};
+    std::vector<unsigned char> bin(68, 0);
+    std::memcpy(bin.data(), pos, sizeof(pos));
+    std::memcpy(bin.data() + 36, uv, sizeof(uv));
+    std::memcpy(bin.data() + 60, idx, sizeof(idx));
+    return bin;
+}
+
+const char* kTriangleJson =
+    R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"rotation":[0,0,0.7071067811865476,0.7071067811865476],"children":[1]},{"mesh":0,"translation":[1,0,0]}],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"TEXCOORD_0":1},"indices":2}]}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5126,"count":3,"type":"VEC2"},{"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":24},{"buffer":0,"byteOffset":60,"byteLength":6}],"buffers":[{"byteLength":68}]})";
+
+TEST(MeshLoader, FormatComesFromTheFilename){
+    EXPECT_EQ(meshFormatFromPath("steak.obj"), MeshFormat::Obj);
+    EXPECT_EQ(meshFormatFromPath("Steak.OBJ"), MeshFormat::Obj);
+    EXPECT_EQ(meshFormatFromPath("/models/cut.gltf"), MeshFormat::Gltf);
+    EXPECT_EQ(meshFormatFromPath("cut.GLB"), MeshFormat::Gltf);
+    EXPECT_EQ(meshFormatName(MeshFormat::Obj), "obj");
+    EXPECT_EQ(meshFormatName(MeshFormat::Gltf), "gltf");
+    EXPECT_THROW(meshFormatFromPath("steak.fbx"), std::runtime_error);
+}
+
+TEST(MeshLoader, Steak2KeepsBothBaseColorsAndDropsTheDuplicateShell){
+    const Mesh loaded = loadMesh(STEAK2_GLB);
+    EXPECT_EQ(loaded.format, MeshFormat::Gltf);
+    ASSERT_EQ(loaded.materials.size(), 2u);
+    EXPECT_EQ(loaded.materials[0].name, "Mat.1");
+    EXPECT_EQ(loaded.materials[1].name, "material");
+    ASSERT_EQ(loaded.images.size(), 2u);
+    EXPECT_EQ(loaded.images[0].name, "Mat.1_baseColor");
+    EXPECT_EQ(loaded.images[1].name, "material_baseColor");
+    EXPECT_FALSE(loaded.images[0].encoded.empty());
+    EXPECT_FALSE(loaded.images[1].encoded.empty());
+    EXPECT_EQ(loaded.parts.size(), 4u);
+
+    const Mesh mesh = dropOverlappingParts(loaded);
+    ASSERT_EQ(mesh.parts.size(), 2u);
+    EXPECT_NE(mesh.parts[0].material, mesh.parts[1].material);
+    EXPECT_LT(mesh.indices.size(), loaded.indices.size());
+}
+
+TEST(MeshLoader, ObjKeepsFilePositions){
+    const Mesh mesh = loadMesh(STEAK_OBJ);
+    EXPECT_EQ(mesh.format, MeshFormat::Obj);
+    EXPECT_EQ(mesh.indices.size() % 3, 0u);
+    EXPECT_GT(mesh.indices.size(), 0u);
+    EXPECT_EQ(mesh.texcoords.size(), mesh.positions.size());
+    EXPECT_THROW(loadMesh(STEAK_OBJ, MeshFormat::Gltf), std::runtime_error);
+}
+
+TEST(MeshLoader, GltfAppliesNodeTransformAndTexcoord){
+    const auto dir = meshTestDir("gltf");
+    const auto bin = triangleBin();
+    writeBytes(dir / "mesh.bin", bin.data(), bin.size());
+    std::string json = kTriangleJson;
+    const auto buffers = json.rfind("\"buffers\"");
+    json.insert(buffers + std::char_traits<char>::length("\"buffers\":[{"), "\"uri\":\"mesh.bin\",");
+    writeBytes(dir / "cut.GLTF", json.data(), json.size());
+
+    const Mesh detected = loadMesh((dir / "cut.GLTF").string());
+    EXPECT_EQ(detected.format, MeshFormat::Gltf);
+    const Mesh mesh = loadMesh((dir / "cut.GLTF").string(), MeshFormat::Gltf);
+    ASSERT_EQ(mesh.positions.size(), 3u);
+    ASSERT_EQ(mesh.indices.size(), 3u);
+    EXPECT_EQ(mesh.indices[0], 0u);
+    EXPECT_EQ(mesh.indices[1], 1u);
+    EXPECT_EQ(mesh.indices[2], 2u);
+    // Child translation (1,0,0), then parent +90 deg about Z.
+    EXPECT_NEAR(mesh.positions[0].x, 0.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[0].y, 1.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[0].z, 0.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[1].x, 0.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[1].y, 2.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[2].x, -1.0f, 1e-5f);
+    EXPECT_NEAR(mesh.positions[2].y, 1.0f, 1e-5f);
+    EXPECT_EQ(mesh.texcoords.size(), 3u);
+    EXPECT_FLOAT_EQ(mesh.texcoords[1].x, 1.0f);
+    EXPECT_FLOAT_EQ(mesh.texcoords[1].y, 0.0f);
+    EXPECT_THROW(loadMesh((dir / "cut.GLTF").string(), MeshFormat::Obj), std::runtime_error);
+}
+
+TEST(MeshLoader, GlbReadsTheSameTriangle){
+    const auto dir = meshTestDir("glb");
+    std::string json = kTriangleJson;
+    while (json.size() % 4 != 0) json.push_back(' ');
+    const auto bin = triangleBin();
+    const uint32_t jsonLen = static_cast<uint32_t>(json.size());
+    const uint32_t binLen = static_cast<uint32_t>(bin.size());
+    const uint32_t total = 12 + 8 + jsonLen + 8 + binLen;
+    std::ofstream out(dir / "cut.glb", std::ios::binary);
+    const auto u32 = [&](uint32_t v){ out.write(reinterpret_cast<const char*>(&v), 4); };
+    u32(0x46546C67u);
+    u32(2u);
+    u32(total);
+    u32(jsonLen);
+    u32(0x4E4F534Au);
+    out.write(json.data(), json.size());
+    u32(binLen);
+    u32(0x004E4942u);
+    out.write(reinterpret_cast<const char*>(bin.data()), bin.size());
+    ASSERT_TRUE(out);
+    out.close();
+
+    const Mesh mesh = loadMesh((dir / "cut.glb").string());
+    EXPECT_EQ(mesh.format, MeshFormat::Gltf);
+    ASSERT_EQ(mesh.positions.size(), 3u);
+    EXPECT_NEAR(mesh.positions[0].y, 1.0f, 1e-5f);
+    EXPECT_FLOAT_EQ(mesh.texcoords[2].y, 1.0f);
+}
+
+TEST(MeshLoader, GltfStripAndFanBecomeTriangleLists){
+    const auto dir = meshTestDir("strip");
+    const float pos[] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0};
+    const uint16_t idx[] = {0, 1, 2, 3};
+    std::vector<unsigned char> bin(56, 0);
+    std::memcpy(bin.data(), pos, sizeof(pos));
+    std::memcpy(bin.data() + 48, idx, sizeof(idx));
+    writeBytes(dir / "mesh.bin", bin.data(), bin.size());
+
+    const auto write = [&](const char* name, int mode){
+        std::ofstream json(dir / name);
+        json << R"({"asset":{"version":"2.0"},"meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1,"mode":)" << mode
+             << R"(}]}],"accessors":[{"bufferView":0,"componentType":5126,"count":4,"type":"VEC3"},{"bufferView":1,"componentType":5123,"count":4,"type":"SCALAR"}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":48},{"buffer":0,"byteOffset":48,"byteLength":8}],"buffers":[{"uri":"mesh.bin","byteLength":56}]})";
+        if (!json) throw std::runtime_error("failed to write glTF");
+    };
+    write("strip.gltf", 5);
+    write("fan.gltf", 6);
+
+    const Mesh strip = loadMesh((dir / "strip.gltf").string());
+    ASSERT_EQ(strip.indices, (std::vector<uint32_t>{0, 1, 2, 2, 1, 3}));
+    const Mesh fan = loadMesh((dir / "fan.gltf").string());
+    ASSERT_EQ(fan.indices, (std::vector<uint32_t>{0, 1, 2, 0, 2, 3}));
 }
 
 }  // namespace

@@ -34,12 +34,11 @@ std::vector<char> readFile(const std::string& filename){
 }  // namespace
 
 std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid){
-    const size_t layer = dims.x;
     const size_t slab = size_t(dims.x) * dims.y;
-    if (solid.size() != slab * dims.z) throw std::invalid_argument("makePanCells: solid mask size != grid size");
+    if (dims.z == 0 || solid.size() != slab * dims.z) throw std::invalid_argument("makePanCells: solid mask size != grid size");
     std::vector<uint32_t> cells(solid.size());
     for (size_t i = 0; i < cells.size(); ++i){
-        const bool panLayer = i % slab < layer;
+        const bool panLayer = i < slab;  // z == 0
         cells[i] = panLayer ? CELL_PAN : (solid[i] != 0 ? CELL_SOLID : CELL_AIR);
     }
     return cells;
@@ -77,22 +76,23 @@ HeatSolver::HeatSolver(const vk::raii::Device& device, const vk::raii::PhysicalD
         .layout = pipelineLayout});
 }
 
-HeatGrid HeatSolver::run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress){
-    return run(params, makeBlockCells(params.dims), steps, progress);
+HeatGrid HeatSolver::run(const HeatParams& params, uint32_t steps, const std::function<void(float)>& progress,
+                         HeatStepHook* hook){
+    return run(params, makeBlockCells(params.dims), steps, progress, hook);
 }
 
 HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps,
-                         const std::function<void(float)>& progress){
+                         const std::function<void(float)>& progress, HeatStepHook* hook){
     std::vector<float> initial(cells.size(), params.initialTemp);
     for (size_t i = 0; i < cells.size(); ++i){
         if (cells[i] == CELL_PAN) initial[i] = params.panTemp;
         else if (cells[i] == CELL_AIR) initial[i] = params.airTemp;
     }
-    return run(params, cells, initial, steps, progress);
+    return run(params, cells, initial, steps, progress, hook);
 }
 
 HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, const std::vector<float>& initial,
-                         uint32_t steps, const std::function<void(float)>& progress){
+                         uint32_t steps, const std::function<void(float)>& progress, HeatStepHook* hook){
     HeatGrid grid{.dims = params.dims, .spacing = params.spacing, .time = steps * params.timeStep, .cells = cells};
     if (grid.cellCount() == 0) throw std::invalid_argument("heat solver: empty grid");
     if (initial.size() != grid.cellCount()) throw std::invalid_argument("heat solver: initial field size != grid size");
@@ -150,6 +150,7 @@ HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& 
         }
         device.updateDescriptorSets(writes, {});
     }
+    if (hook) hook->prepare(*fields[0].first, *fields[1].first);
 
     const HeatStepParams stepParams{.dims = params.dims, .fourier = params.fourier(), .panTemp = params.panTemp,
                                     .panCoupling = params.panCoupling(), .airTemp = params.airTemp,
@@ -188,17 +189,21 @@ HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& 
         commandBuffer.copyBuffer(*staging, *fields[0].first, wholeBuffer);
         commandBuffer.copyBuffer(*staging, *cellBuffer, vk::BufferCopy{.srcOffset = bytes, .size = bytes});
         commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadToCompute});
+        if (hook) hook->recordInit(commandBuffer);
     };
     auto recordDispatches = [&](vk::raii::CommandBuffer& commandBuffer, uint32_t begin, uint32_t end){
-        commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
-        commandBuffer.pushConstants<HeatStepParams>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
         for (uint32_t step = begin; step < end; ++step){
+            // Rebound every step: a color hook binds its own pipeline and overwrites push constants.
+            commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+            commandBuffer.pushConstants<HeatStepParams>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
             commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, *descriptorSets[step % 2], nullptr);
             commandBuffer.dispatch(groups.x, groups.y, groups.z);
             commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &betweenSteps});
+            if (hook) hook->recordAfterStep(commandBuffer, step);
         }
     };
     auto recordReadback = [&](vk::raii::CommandBuffer& commandBuffer){
+        if (hook) hook->recordReadback(commandBuffer);
         commandBuffer.copyBuffer(*fields[steps % 2].first, *staging, wholeBuffer);
         commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
     };

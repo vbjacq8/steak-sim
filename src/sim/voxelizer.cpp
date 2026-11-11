@@ -17,8 +17,9 @@ struct VoxelizeParams{
     glm::uvec3 dims;
     uint32_t triangleCount;
     uint32_t vertexStride;
+    uint32_t captureUv;
 };
-static_assert(sizeof(VoxelizeParams) == 36);
+static_assert(sizeof(VoxelizeParams) == 40);
 
 std::vector<char> readFile(const std::string& filename){
     std::ifstream file(filename, std::ios::ate | std::ios::binary);
@@ -47,7 +48,7 @@ Voxelizer::Voxelizer(const vk::raii::Device& device, const vk::raii::PhysicalDev
     commandPool = vk::raii::CommandPool(device, vk::CommandPoolCreateInfo{
         .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer, .queueFamilyIndex = queueFamilyIndex});
 
-    std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
+    std::array<vk::DescriptorSetLayoutBinding, 5> bindings{};
     for (uint32_t i = 0; i < bindings.size(); ++i){
         bindings[i] = {.binding = i, .descriptorType = vk::DescriptorType::eStorageBuffer,
                        .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute};
@@ -68,7 +69,7 @@ Voxelizer::Voxelizer(const vk::raii::Device& device, const vk::raii::PhysicalDev
         .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = module, .pName = "voxelizeMain"},
         .layout = pipelineLayout});
 
-    vk::DescriptorPoolSize poolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 3};
+    vk::DescriptorPoolSize poolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 5};
     descriptorPool = vk::raii::DescriptorPool(device, vk::DescriptorPoolCreateInfo{
         .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
         .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &poolSize});
@@ -77,17 +78,26 @@ Voxelizer::Voxelizer(const vk::raii::Device& device, const vk::raii::PhysicalDev
 }
 
 VoxelGrid Voxelizer::voxelize(vk::Buffer vertexBuffer, uint32_t vertexStrideFloats, vk::Buffer indexBuffer,
-                              uint32_t triangleCount, glm::vec3 low, glm::vec3 high, float voxelSize){
+                              uint32_t triangleCount, glm::vec3 low, glm::vec3 high, float voxelSize,
+                              vk::Buffer texcoords, uint32_t texcoordCount){
     VoxelGrid grid = makeVoxelGridLayout(low, high, voxelSize);
+    const bool captureUv = static_cast<bool>(texcoords) && texcoordCount > 0;
     const vk::DeviceSize voxelBufferSize = grid.cellCount() * sizeof(uint32_t);
+    const vk::DeviceSize uvBufferSize = grid.cellCount() * sizeof(glm::vec2);
     auto [voxelBuffer, voxelBufferMemory] = createHostBuffer(voxelBufferSize, vk::BufferUsageFlagBits::eStorageBuffer);
+    // The shader always has the UV bindings. A tiny stand-in is bound when UVs are not requested,
+    // and the shader does not touch it (captureUv is 0).
+    auto [vertexUvBuffer, vertexUvMemory] = createHostBuffer(16, vk::BufferUsageFlagBits::eStorageBuffer);
+    auto [voxelUvBuffer, voxelUvMemory] = createHostBuffer(captureUv ? uvBufferSize : 16, vk::BufferUsageFlagBits::eStorageBuffer);
 
-    std::array<vk::DescriptorBufferInfo, 3> bufferInfos{{
+    std::array<vk::DescriptorBufferInfo, 5> bufferInfos{{
         {.buffer = vertexBuffer, .offset = 0, .range = vk::WholeSize},
         {.buffer = indexBuffer, .offset = 0, .range = vk::WholeSize},
         {.buffer = voxelBuffer, .offset = 0, .range = vk::WholeSize},
+        {.buffer = captureUv ? texcoords : *vertexUvBuffer, .offset = 0, .range = vk::WholeSize},
+        {.buffer = voxelUvBuffer, .offset = 0, .range = vk::WholeSize},
     }};
-    std::array<vk::WriteDescriptorSet, 3> writes{};
+    std::array<vk::WriteDescriptorSet, 5> writes{};
     for (uint32_t i = 0; i < writes.size(); ++i){
         writes[i] = {.dstSet = descriptorSet, .dstBinding = i, .descriptorCount = 1,
                      .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &bufferInfos[i]};
@@ -100,6 +110,7 @@ VoxelGrid Voxelizer::voxelize(vk::Buffer vertexBuffer, uint32_t vertexStrideFloa
         .dims = grid.dims,
         .triangleCount = triangleCount,
         .vertexStride = vertexStrideFloats,
+        .captureUv = captureUv ? 1u : 0u,
     };
     const glm::uvec3 groups = (grid.dims + GROUP_SIZE - 1u) / GROUP_SIZE;
 
@@ -126,6 +137,12 @@ VoxelGrid Voxelizer::voxelize(vk::Buffer vertexBuffer, uint32_t vertexStrideFloa
     void* data = voxelBufferMemory.mapMemory(0, voxelBufferSize);
     std::memcpy(grid.cells.data(), data, voxelBufferSize);
     voxelBufferMemory.unmapMemory();
+    if (captureUv){
+        grid.uv.resize(grid.cellCount());
+        void* uvs = voxelUvMemory.mapMemory(0, uvBufferSize);
+        std::memcpy(grid.uv.data(), uvs, uvBufferSize);
+        voxelUvMemory.unmapMemory();
+    }
     return grid;
 }
 
@@ -151,6 +168,36 @@ VoxelGrid Voxelizer::voxelize(const std::vector<glm::vec3>& positions, const std
 
     return voxelize(*positionBuffer, sizeof(glm::vec3) / sizeof(float), *indexBuffer,
                     static_cast<uint32_t>(indices.size() / 3), low, high, voxelSize);
+}
+
+VoxelGrid Voxelizer::voxelize(const std::vector<glm::vec3>& positions, const std::vector<glm::vec2>& texcoords,
+                              const std::vector<uint32_t>& indices, float voxelSize){
+    if (positions.empty() || indices.size() < 3) throw std::invalid_argument("voxelize: empty mesh");
+    if (texcoords.size() != positions.size()) throw std::invalid_argument("voxelize: texcoord count != vertex count");
+
+    glm::vec3 low(std::numeric_limits<float>::max());
+    glm::vec3 high(std::numeric_limits<float>::lowest());
+    for (const glm::vec3& p : positions){
+        low = glm::min(low, p);
+        high = glm::max(high, p);
+    }
+
+    const vk::DeviceSize positionBytes = positions.size() * sizeof(glm::vec3);
+    const vk::DeviceSize uvBytes = texcoords.size() * sizeof(glm::vec2);
+    const vk::DeviceSize indexBytes = indices.size() * sizeof(uint32_t);
+    auto [positionBuffer, positionMemory] = createHostBuffer(positionBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    auto [uvBuffer, uvMemory] = createHostBuffer(uvBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    auto [indexBuffer, indexMemory] = createHostBuffer(indexBytes, vk::BufferUsageFlagBits::eStorageBuffer);
+    std::memcpy(positionMemory.mapMemory(0, positionBytes), positions.data(), positionBytes);
+    positionMemory.unmapMemory();
+    std::memcpy(uvMemory.mapMemory(0, uvBytes), texcoords.data(), uvBytes);
+    uvMemory.unmapMemory();
+    std::memcpy(indexMemory.mapMemory(0, indexBytes), indices.data(), indexBytes);
+    indexMemory.unmapMemory();
+
+    return voxelize(*positionBuffer, sizeof(glm::vec3) / sizeof(float), *indexBuffer,
+                    static_cast<uint32_t>(indices.size() / 3), low, high, voxelSize, *uvBuffer,
+                    static_cast<uint32_t>(texcoords.size()));
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> Voxelizer::createHostBuffer(vk::DeviceSize size,

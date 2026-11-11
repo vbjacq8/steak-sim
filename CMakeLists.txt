@@ -23,17 +23,23 @@ FetchContent_Declare(tinyobjloader
   GIT_TAG v2.0.0rc13
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR none)
+FetchContent_Declare(tinygltf
+  GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
+  GIT_TAG v2.9.7
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR none)
 FetchContent_Declare(stb
   GIT_REPOSITORY https://github.com/nothings/stb.git
   GIT_TAG master
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR none)
-FetchContent_MakeAvailable(glm tinyobjloader stb)
+FetchContent_MakeAvailable(glm tinyobjloader tinygltf stb)
 
 add_library(steak_third_party INTERFACE)
 target_include_directories(steak_third_party INTERFACE
   ${glm_SOURCE_DIR}
   ${tinyobjloader_SOURCE_DIR}
+  ${tinygltf_SOURCE_DIR}
   ${stb_SOURCE_DIR})
 
 # Every executable lands directly in the build directory; compiled shaders go in build/shaders.

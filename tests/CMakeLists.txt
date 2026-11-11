@@ -25,11 +25,16 @@ add_dependencies(voxel_tests voxel_test_shaders)
 target_link_libraries(voxel_tests PRIVATE steak_voxelizer GTest::gtest_main)
 target_compile_definitions(voxel_tests PRIVATE
   VOXEL_TESTS_SPV="${TEST_SHADER_SPV}"
-  STEAK_OBJ="${STEAK_OBJ}")
+  STEAK_OBJ="${STEAK_OBJ}"
+  STEAK2_GLB="${CMAKE_SOURCE_DIR}/src/assets/steak2/steak_3d_model_by_mohjustic_noknife.glb")
 
 add_executable(heat_tests heat_tests.cpp)
 target_link_libraries(heat_tests PRIVATE steak_voxelizer GTest::gtest_main)
 
+add_executable(color_tests color_tests.cpp)
+target_link_libraries(color_tests PRIVATE steak_voxelizer GTest::gtest_main)
+
 include(GoogleTest)
 gtest_discover_tests(voxel_tests DISCOVERY_TIMEOUT 60)
 gtest_discover_tests(heat_tests DISCOVERY_TIMEOUT 60)
+gtest_discover_tests(color_tests DISCOVERY_TIMEOUT 60)

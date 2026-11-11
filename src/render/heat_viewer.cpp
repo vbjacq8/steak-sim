@@ -1,4 +1,4 @@
-// Heat viewer: runs the finite-difference heat solver on a solid block whose y = 0 layer is the pan, then
+// Heat viewer: runs the finite-difference heat solver on a solid block whose z = 0 layer is the pan, then
 // shows the result (see heat_view.hpp for the keys). The scenario is the HeatParams defaults.
 
 #include "compute_context.hpp"
