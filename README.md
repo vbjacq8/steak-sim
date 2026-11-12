@@ -37,6 +37,9 @@ Executables are written directly to `build/`, compiled shaders to `build/shaders
 |------------|---------|
 | `build/steak_sim` | Main Vulkan app: renders the steak and voxelizes it |
 | `build/voxel_viewer [model.obj] [voxelSize]` | Draws the voxel grid as box outlines with a color key |
+| `build/steak_heat_demo [model]` | Cooks the steak on a pan and shows the temperature, cooked color, and textured mesh |
+| `build/steak_heat_live [model]` | The same cook played on a clock: Start, Pause, Reset, adjustable speed |
+| `build/steak_grill_live [model]` | `steak_heat_live` on a grill: 5 bars at the pan temperature instead of a solid pan |
 | `build/voxel_tests` | Unit tests for the voxelizer and its shader math |
 
 Options: `-DSTEAK_ASSET=<folder>` picks which `src/assets/` folder is loaded (default `steak1`); `-DSTEAK_BUILD_RENDER=OFF` skips the GLFW/Open3D executables; `-DSTEAK_BUILD_TESTS=OFF` skips the tests.

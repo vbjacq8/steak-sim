@@ -15,7 +15,8 @@ C++20 + Vulkan project. No databases or external services.
 | `src/render/heat_viewer.cpp` | `heat_viewer`: heat sim on a solid block, shown in the heat-map window |
 | `src/render/steak_heat_demo.cpp` | `steak_heat_demo`: voxel heat and cooked color; toggles the temperature map, that texture, and the textured mesh |
 | `src/render/steak_heat_live.cpp` | `steak_heat_live`: the same cook played on a clock (Start/Pause/Reset, adjustable speed) in the same window; the heat-map window's live mode drives it from a worker thread |
-| `src/render/demo_mesh.cpp` | `steak_demo_mesh`: model loading, texture-atlas packing and scaling shared by the two steak demos |
+| `src/render/steak_grill_live.cpp` | `steak_grill_live`: `steak_heat_live` on a grill, 5 bars at the pan temperature (`HeatParams::grillSpokes`) with air between them |
+| `src/render/demo_mesh.cpp` | `steak_demo_mesh`: model loading, texture-atlas packing and scaling shared by the steak demos, and `runLiveDemo` for the live ones |
 | `src/tools/doneness_calibrate.cpp` | `doneness_calibrate`: headless; cooks a flipped 1D column to a center temperature and prints each layer's peak, for calibrating the doneness table |
 | `src/shaders/{render,compute}/` | Slang shaders, compiled by `slangc` |
 | `tests/` | `voxel_tests` and `heat_tests` (GoogleTest) plus `voxel_tests.slang` |
@@ -31,7 +32,7 @@ cmake --build build -j
 - Shader and asset paths are compile-time absolute paths (`VOXELIZE_SPV`, `MODEL_SHADER_SPV`, `STEAK_OBJ`, ...), so binaries don't depend on the working directory.
 - Requires the Vulkan SDK (`slangc` is found via `$VULKAN_SDK/bin`). The render executables also need GLFW and Open3D (looked up in `~/open3d_install`); pass `-DSTEAK_BUILD_RENDER=OFF` to build only the library and tests.
 - The heat sim scenario is the `HeatParams` defaults in `src/sim/heat_solver.hpp`. `steak_heat_demo` treats the mesh as centimeters. The explicit scheme needs `alpha*dt/dx^2 <= ~1/6`.
-- The pan is the low layer along `HeatParams::panAxis` (z by default). The steak demos set it to the model's thinnest axis: y for steak1, z for steak2.
+- The pan is the low layer along `HeatParams::panAxis` (z by default). The steak demos set it to the model's thinnest axis: y for steak1, z for steak2. With `HeatParams::grillSpokes > 0` that layer is grill bars and air instead (`makeCookCells`).
 
 ## Test
 

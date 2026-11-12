@@ -1,6 +1,7 @@
 #include "heat_solver.hpp"
 
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -58,6 +59,38 @@ std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>&
         }
     }
     return cells;
+}
+
+std::vector<uint32_t> makeGrillCells(glm::uvec3 dims, const std::vector<uint32_t>& solid, uint32_t panAxis, uint32_t spokes,
+                                     uint32_t spokeCells){
+    if (spokes == 0 || spokeCells == 0) throw std::invalid_argument("makeGrillCells: need at least one spoke one cell wide");
+    std::vector<uint32_t> cells = makePanCells(dims, solid, panAxis);
+    const uint32_t u = (panAxis + 1) % 3;
+    const uint32_t v = (panAxis + 2) % 3;
+    const uint32_t across = dims[u] >= dims[v] ? u : v;
+    std::vector<bool> onSpoke(dims[across], false);
+    for (uint32_t i = 0; i < spokes; ++i){
+        const double center = (i + 0.5) * dims[across] / spokes;
+        const long start = std::lround(center - 0.5 * spokeCells);
+        for (long c = std::max(0L, start); c < std::min<long>(start + spokeCells, dims[across]); ++c) onSpoke[c] = true;
+    }
+    for (uint32_t z = 0; z < dims.z; ++z){
+        for (uint32_t y = 0; y < dims.y; ++y){
+            for (uint32_t x = 0; x < dims.x; ++x){
+                const glm::uvec3 cell(x, y, z);
+                if (cell[panAxis] != 0 || onSpoke[cell[across]]) continue;
+                cells[x + dims.x * (y + size_t(dims.y) * z)] = CELL_AIR;
+            }
+        }
+    }
+    return cells;
+}
+
+std::vector<uint32_t> makeCookCells(const HeatParams& params, const std::vector<uint32_t>& solid){
+    if (params.grillSpokes == 0) return makePanCells(params.dims, solid, params.panAxis);
+    if (!(params.spokeWidth > 0.0f) || !(params.spacing > 0.0f)) throw std::invalid_argument("makeCookCells: spoke width must be positive");
+    const auto spokeCells = static_cast<uint32_t>(std::max(1L, std::lround(params.spokeWidth / params.spacing)));
+    return makeGrillCells(params.dims, solid, params.panAxis, params.grillSpokes, spokeCells);
 }
 
 std::vector<uint32_t> makeBlockCells(glm::uvec3 dims){

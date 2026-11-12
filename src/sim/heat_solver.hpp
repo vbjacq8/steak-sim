@@ -29,6 +29,8 @@ struct HeatParams{
     float airTemp = 212.0f;          // F; raise toward 212 to model steam
     float duration = 240.0f;        // simulated time for the viewers, s; the solver takes a step count
     uint32_t panAxis = 2;           // makePanCells puts the pan in the low layer along this axis (0 x, 1 y, 2 z)
+    uint32_t grillSpokes = 0;       // 0: that layer is a solid pan; otherwise it is this many grill bars (makeGrillCells)
+    float spokeWidth = 9.0e-3f;     // width of each grill bar, m
 
     // r = alpha dt / dx^2.
     float fourier() const { return diffusivity * timeStep / (spacing * spacing); }
@@ -83,6 +85,16 @@ struct HeatGrid{
 // Cell kinds for a grid that is CELL_SOLID where `solid` is nonzero (e.g. VoxelGrid::cells) and CELL_AIR
 // elsewhere, except that the whole low layer along `panAxis` (z = 0 by default) is the pan.
 std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid, uint32_t panAxis = 2);
+
+// makePanCells with a grill in place of the pan: the low layer along `panAxis` is CELL_PAN only in `spokes` bars
+// `spokeCells` cells wide and CELL_AIR between them. The bars are spaced evenly along the longer side of that
+// layer, centered at (i + 1/2) / spokes of its length, and run the full length of the other side.
+std::vector<uint32_t> makeGrillCells(glm::uvec3 dims, const std::vector<uint32_t>& solid, uint32_t panAxis, uint32_t spokes,
+                                     uint32_t spokeCells);
+
+// The cooking surface `params` describes: makeGrillCells when params.grillSpokes > 0 (bars params.spokeWidth wide,
+// at least one cell), makePanCells otherwise.
+std::vector<uint32_t> makeCookCells(const HeatParams& params, const std::vector<uint32_t>& solid);
 
 // A grid that is solid everywhere, with the z = 0 layer as the pan.
 std::vector<uint32_t> makeBlockCells(glm::uvec3 dims);

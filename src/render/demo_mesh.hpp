@@ -44,3 +44,8 @@ HeatSurface demoSurface(const DemoMesh& mesh);
 
 // Throws std::invalid_argument when cells `spacing` meters wide would put over 500 on the model's long axis.
 void checkCellCount(const DemoMesh& mesh, float spacing);
+
+// Loads the model at `path`, then opens showLiveHeatGrid on it, cooking with `params` (panAxis set to the model's
+// thinnest axis) through MeshHeatColorSession. `name` prefixes the window title and error messages. Returns
+// the process exit code.
+int runLiveDemo(const std::string& name, const std::string& path, const std::string& fallbackTexture, HeatParams params);

@@ -115,6 +115,23 @@ TEST(HeatSolver, PanCellsAlongY){
     EXPECT_THROW(makePanCells(dims, std::vector<uint32_t>(12, 1u), 3), std::invalid_argument);
 }
 
+// 5 bars, 2 cells wide, across a 20 x 4 layer at z = 0: centered at 2, 6, 10, 14, 18 along x, the long side.
+TEST(HeatSolver, GrillCellsAreEvenlySpacedBars){
+    const glm::uvec3 dims(20, 4, 3);
+    const std::vector<uint32_t> cells = makeGrillCells(dims, std::vector<uint32_t>(240, 1u), 2, 5, 2);
+    for (uint32_t y = 0; y < dims.y; ++y){
+        for (uint32_t x = 0; x < dims.x; ++x){
+            const bool bar = x % 4 == 1 || x % 4 == 2;
+            EXPECT_EQ(cells[x + dims.x * y], bar ? CELL_PAN : CELL_AIR) << "x = " << x << ", y = " << y;
+            EXPECT_EQ(cells[x + dims.x * (y + dims.y * 1)], CELL_SOLID);
+        }
+    }
+    HeatParams params{.dims = dims};
+    params.grillSpokes = 5;
+    params.spokeWidth = 2.0f * params.spacing;
+    EXPECT_EQ(makeCookCells(params, std::vector<uint32_t>(240, 1u)), cells);
+}
+
 TEST(HeatSolver, UniformFieldStaysUniform){
     REQUIRE_VULKAN();
     const HeatParams params{.dims = {16, 16, 16}, .initialTemp = 70.0f, .panTemp = 70.0f};
@@ -305,6 +322,35 @@ TEST(SteakPipeline, VoxelizedBoxHeatsFromThePan){
     if (far > 1 && heat.kind(c.x, c.y, far) == CELL_SOLID){
         EXPECT_LE(heat.at(c.x, c.y, far), heat.at(c.x, c.y, 1));
     }
+}
+
+// On a grill the meat right above a bar sears; above a gap it only sees air.
+TEST(SteakPipeline, GrillHeatsOverTheBars){
+    REQUIRE_VULKAN();
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> indices;
+    appendBox(positions, indices, {0.0f, 0.0f, 0.0f}, {2.0f, 2.0f, 1.0f});
+    HeatParams params;
+    params.grillSpokes = 5;
+    params.spokeWidth = params.spacing;
+    const HeatGrid heat = simulateMeshHeat(gpu()->ctx, positions, indices, 0.01f, params, 60).heat;
+    const uint32_t y = heat.dims.y / 2;
+    uint32_t bars = 0, gaps = 0;
+    float barTemp = 0.0f, gapTemp = 0.0f;
+    for (uint32_t x = 0; x < heat.dims.x; ++x){
+        if (heat.kind(x, y, 1) != CELL_SOLID) continue;
+        if (heat.kind(x, y, 0) == CELL_PAN){
+            ++bars;
+            barTemp += heat.at(x, y, 1);
+        } else{
+            ASSERT_EQ(heat.kind(x, y, 0), CELL_AIR);
+            ++gaps;
+            gapTemp += heat.at(x, y, 1);
+        }
+    }
+    ASSERT_GT(bars, 0u);
+    ASSERT_GT(gaps, 0u);
+    EXPECT_GT(barTemp / bars, gapTemp / gaps + 20.0f);
 }
 
 // The same kind of box standing on its side: with panAxis = 1 the y = 0 layer is the pan and heat comes in along y.

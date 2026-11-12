@@ -73,8 +73,10 @@ target_compile_definitions(steak_heat_demo PRIVATE
   STEAK_OBJ="${STEAK_OBJ}"
   STEAK_TEXTURE="${STEAK_TEXTURE}")
 
-add_executable(steak_heat_live steak_heat_live.cpp)
-target_link_libraries(steak_heat_live PRIVATE steak_demo_mesh)
-target_compile_definitions(steak_heat_live PRIVATE
-  STEAK_OBJ="${STEAK_OBJ}"
-  STEAK_TEXTURE="${STEAK_TEXTURE}")
+foreach(live_demo steak_heat_live steak_grill_live)
+  add_executable(${live_demo} ${live_demo}.cpp)
+  target_link_libraries(${live_demo} PRIVATE steak_demo_mesh)
+  target_compile_definitions(${live_demo} PRIVATE
+    STEAK_OBJ="${STEAK_OBJ}"
+    STEAK_TEXTURE="${STEAK_TEXTURE}")
+endforeach()

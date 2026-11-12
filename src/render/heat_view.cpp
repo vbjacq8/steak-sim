@@ -48,6 +48,7 @@ constexpr float COLOR_MIN_F = 70.0f;
 constexpr float COLOR_MAX_F = 200.0f;
 constexpr int MAX_DIM = 256;
 constexpr long MAX_STEPS = 100000;
+constexpr long MAX_SPOKES = 50;
 constexpr std::array<const char*, 3> AXIS_NAMES{"X", "Y", "Z"};
 // Simulated seconds per real second.
 constexpr std::array<double, 9> LIVE_SPEEDS{1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0};
@@ -988,6 +989,26 @@ private:
                      edited.panTransfer = static_cast<float>(value);
                      return true;
                  });
+        if (edited.grillSpokes > 0){
+            addField(panBody, "Grill spokes", true, [this](){ return std::to_string(edited.grillSpokes); },
+                     [this](const std::string& text, std::string& error){
+                         long count = 0;
+                         if (!parseCount(text.c_str(), count, 1, MAX_SPOKES, error, "Grill spokes")) return false;
+                         edited.grillSpokes = static_cast<uint32_t>(count);
+                         return true;
+                     });
+            addField(panBody, "Spoke width (mm)", true, [this](){ return format("%.6g", edited.spokeWidth * MM_PER_M); },
+                     [this](const std::string& text, std::string& error){
+                         double mm = 0.0;
+                         if (!parseNumber(text.c_str(), mm, error)) return false;
+                         if (!(mm > 0.0)){
+                             error = "Spoke width must be positive.";
+                             return false;
+                         }
+                         edited.spokeWidth = static_cast<float>(mm / MM_PER_M);
+                         return true;
+                     });
+        }
         scroll->AddChild(pan);
 
         auto air = makeSection("Air");

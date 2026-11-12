@@ -36,7 +36,7 @@ SteakHeatResult simulateMeshHeat(const ComputeContext& ctx, const std::vector<gl
 
     params.dims = result.voxels.dims;
     HeatSolver solver(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, FINITE_DIFFERENCE_SPV);
-    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells, params.panAxis);
+    const std::vector<uint32_t> cells = makeCookCells(params, result.voxels.cells);
     if (progress){
         result.heat = solver.run(params, cells, steps, [&](float fraction){ progress(0.2f + 0.8f * fraction); });
     } else{
@@ -58,7 +58,7 @@ SteakHeatResult simulateMeshHeatColor(const ComputeContext& ctx, const std::vect
     if (progress) progress(0.2f);
 
     params.dims = result.voxels.dims;
-    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells, params.panAxis);
+    const std::vector<uint32_t> cells = makeCookCells(params, result.voxels.cells);
     ColorSolver color(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, COLOR_INIT_SPV, COLOR_KINETICS_SPV,
                       COLOR_EXPORT_SPV);
     color.prepareGrid(result.voxels.dims, cells, result.voxels.uv, rgba, textureWidth, textureHeight, params.timeStep);
@@ -82,7 +82,7 @@ MeshHeatColorSession::MeshHeatColorSession(const ComputeContext& ctx, const std:
       color(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, COLOR_INIT_SPV, COLOR_KINETICS_SPV, COLOR_EXPORT_SPV),
       solver(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, FINITE_DIFFERENCE_SPV){
     params.dims = voxelGrid.dims;
-    const std::vector<uint32_t> cells = makePanCells(params.dims, voxelGrid.cells, params.panAxis);
+    const std::vector<uint32_t> cells = makeCookCells(params, voxelGrid.cells);
     color.prepareGrid(voxelGrid.dims, cells, voxelGrid.uv, rgba, textureWidth, textureHeight, params.timeStep);
     session.emplace(solver, params, cells, &color);
 }

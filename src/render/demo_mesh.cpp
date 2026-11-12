@@ -1,11 +1,15 @@
 #include "demo_mesh.hpp"
 
+#include "steak_pipeline.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -356,4 +360,52 @@ void checkCellCount(const DemoMesh& mesh, float spacing){
     if (!(voxelSize > 0.0f) || longestAxis(mesh.positions) / voxelSize > 500.0f){
         throw std::invalid_argument("Cell size is too small; the grid would exceed 512 cells on a side.");
     }
+}
+
+namespace {
+
+class DemoLive : public LiveHeat{
+public:
+    DemoLive(DemoMesh meshIn, const std::string& name) : mesh(std::move(meshIn)), ctx(name.c_str()){}
+
+    HeatGrid restart(const HeatParams& params) override{
+        checkCellCount(mesh, params.spacing);
+        run.reset();
+        run = std::make_unique<MeshHeatColorSession>(ctx, mesh.positions, mesh.solverUvs, mesh.indices, mesh.metersPerUnit, params,
+                                                     mesh.atlas.pixels.data(), static_cast<uint32_t>(mesh.atlas.width),
+                                                     static_cast<uint32_t>(mesh.atlas.height));
+        const glm::uvec3 dims = run->voxels().dims;
+        std::cout << "Voxelized into a " << dims.x << "x" << dims.y << "x" << dims.z << " grid (dx "
+                  << params.spacing * 1000.0f << " mm, dt " << params.timeStep << " s, r = " << params.fourier() << ")\n";
+        return run->read();
+    }
+
+    HeatGrid advance(uint32_t steps) override{
+        if (!run) throw std::logic_error("advance before restart");
+        run->advance(steps);
+        return run->read();
+    }
+
+private:
+    DemoMesh mesh;
+    ComputeContext ctx;
+    std::unique_ptr<MeshHeatColorSession> run;
+};
+
+}  // namespace
+
+int runLiveDemo(const std::string& name, const std::string& path, const std::string& fallbackTexture, HeatParams params){
+    try{
+        DemoMesh mesh = prepareDemoMesh(loadMesh(path), fallbackTexture);
+        params.panAxis = mesh.panAxis;
+        std::cout << "Mesh scale: 1 unit = " << mesh.metersPerUnit * 100.0f << " cm, long axis "
+                  << longestAxis(mesh.positions) * mesh.metersPerUnit * 100.0f << " cm, "
+                  << (params.grillSpokes > 0 ? "grill" : "pan") << " on the low " << "xyz"[mesh.panAxis] << " side\n";
+        HeatSurface surface = demoSurface(mesh);
+        showLiveHeatGrid(name + ": " + path, params, std::make_unique<DemoLive>(std::move(mesh), name), true, std::move(surface));
+    } catch (const std::exception& e){
+        std::cerr << name << ": " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }

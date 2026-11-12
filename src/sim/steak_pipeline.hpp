@@ -17,7 +17,8 @@ struct SteakHeatResult{
 
 // Mesh -> voxelizer -> heat solver. The mesh is voxelized with cells params.spacing meters wide, so
 // voxels and heat cells line up one to one. The voxel grid keeps one empty layer of padding on every
-// side of the mesh; the low layer along params.panAxis becomes the pan, touching that face of the steak.
+// side of the mesh; the low layer along params.panAxis becomes the pan, touching that face of the steak,
+// or a grill of params.grillSpokes bars when that is nonzero (makeCookCells).
 // params.dims is ignored (the grid size comes from the mesh bounds).
 //
 // metersPerUnit converts model coordinates to meters (0.01 for a model in centimeters).
