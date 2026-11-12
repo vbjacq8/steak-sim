@@ -32,7 +32,7 @@ add_custom_command(
           -target spirv -profile spirv_1_4 -emit-spirv-directly
           -fvk-use-entrypoint-name -entry colorInitMain
           -o ${COLOR_INIT_SPV}
-  DEPENDS ${COLOR_INIT_SRC} ${COMPUTE_SHADER_DIR}/lab_color.slang
+  DEPENDS ${COLOR_INIT_SRC} ${COMPUTE_SHADER_DIR}/lab_color.slang ${COMPUTE_SHADER_DIR}/doneness.slang
   COMMENT "Compiling Lab texture init shader"
   VERBATIM)
 
@@ -45,8 +45,8 @@ add_custom_command(
           -target spirv -profile spirv_1_4 -emit-spirv-directly
           -fvk-use-entrypoint-name -entry colorKineticsMain
           -o ${COLOR_KINETICS_SPV}
-  DEPENDS ${COLOR_KINETICS_SRC} ${COMPUTE_SHADER_DIR}/cooking_kinetics.slang
-  COMMENT "Compiling color kinetics shader"
+  DEPENDS ${COLOR_KINETICS_SRC} ${COMPUTE_SHADER_DIR}/doneness.slang
+  COMMENT "Compiling color step shader"
   VERBATIM)
 
 set(COLOR_EXPORT_SRC ${COMPUTE_SHADER_DIR}/color_export.slang)

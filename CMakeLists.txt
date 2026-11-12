@@ -54,6 +54,7 @@ set(RENDER_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/render)
 set(COMPUTE_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/compute)
 
 add_subdirectory(src/sim)
+add_subdirectory(src/tools)
 
 if(STEAK_BUILD_RENDER)
   add_subdirectory(src/render)

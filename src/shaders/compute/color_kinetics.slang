@@ -1,17 +1,16 @@
 // One color step. Temperature is degrees Fahrenheit, the unit stored by the heat solver.
-// dt is seconds (HeatParams::timeStep). L* and a* change; b* is copied through.
 //
-// L* and a* follow the two-step kinetics in cooking_kinetics.slang. Their state lives in a 32-bit
-// image that this pass updates in place; the cooked Lab is computed from lab0 and written to labOut.
-// The step is the exact integral while temperature is held constant over dt, not forward Euler.
+// Each solid cell keeps the hottest temperature it has seen, in Celsius, in a 32-bit image that this
+// pass updates in place. Its color is the doneness color for that peak (doneness.slang), computed
+// from the raw Lab in lab0 and written to labOut. Cooling never undoes it.
 
-import cooking_kinetics;
+import doneness;
 
 static const uint CELL_SOLID = 1u;
 
 struct ColorPush {
     uint3 dims;
-    float dt;
+    float dt; // unused here; present so every color pass shares one push-constant layout
 };
 
 [[vk::push_constant]]
@@ -36,8 +35,8 @@ RWTexture3D<float4> lab0; // immutable raw Lab
 RWTexture3D<float4> labOut;
 
 [[vk::binding(5, 0)]]
-[[vk::image_format("rgba32f")]]
-RWTexture3D<float4> cookState; // (L* q, L* c, a* q, a* c)
+[[vk::image_format("r32f")]]
+RWTexture3D<float> peakCelsius;
 
 [shader("compute")]
 [numthreads(4, 4, 4)]
@@ -52,7 +51,7 @@ void colorKineticsMain(uint3 id : SV_DispatchThreadID) {
     }
 
     float tC = (temperature[i] - 32.0) * (5.0 / 9.0);
-    float4 next = stepCook(cookState[id], tC, params.dt);
-    cookState[id] = next;
-    labOut[id] = float4(cookedLab(lab0[id].rgb, next), current.a);
+    float peak = max(peakCelsius[id], tC);
+    peakCelsius[id] = peak;
+    labOut[id] = float4(cookedLab(lab0[id].rgb, peak), current.a);
 }

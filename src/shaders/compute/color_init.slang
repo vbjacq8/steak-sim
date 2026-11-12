@@ -3,9 +3,10 @@
 // `voxelUv` comes from the voxelizer: occupied voxels hold the barycentric UV of the closest
 // point on the mesh, empty voxels hold (-1, -1). Only CELL_SOLID voxels become meat. Sampling
 // an sRGB image returns linear RGB, which is then converted to CIELAB. The same value is stored
-// in the immutable lab0 image and in the current Lab image. The cooking kinetics state starts raw
-// for both L* and a*: q = 1 and all of the reactant left (c = 1).
+// in the immutable lab0 image and in the current Lab image. The peak temperature starts below every
+// doneness key, so nothing cooks until a heat step is seen.
 
+import doneness;
 import lab_color;
 
 static const uint CELL_SOLID = 1u; // must match heat_solver.hpp
@@ -39,8 +40,8 @@ RWTexture3D<float4> lab0;
 RWTexture3D<float4> labCurrent;
 
 [[vk::binding(6, 0)]]
-[[vk::image_format("rgba32f")]]
-RWTexture3D<float4> cookState; // (L* q, L* c, a* q, a* c)
+[[vk::image_format("r32f")]]
+RWTexture3D<float> peakCelsius;
 
 [shader("compute")]
 [numthreads(4, 4, 4)]
@@ -56,5 +57,5 @@ void colorInitMain(uint3 id : SV_DispatchThreadID) {
     }
     lab0[id] = lab;
     labCurrent[id] = lab;
-    cookState[id] = float4(1.0, 1.0, 1.0, 1.0);
+    peakCelsius[id] = NO_PEAK_CELSIUS;
 }

@@ -1,12 +1,12 @@
 // Mesh shader for steak_color_demo. Same camera transform as 28_model_loading.slang.
 // The fragment shader cooks the sampled texel in place: sRGB texture -> linear RGB -> CIELAB,
-// then L* and a* follow the two-step cooking kinetics (cooking_kinetics.slang) at one temperature
-// for the whole model. There is no voxel grid.
+// then takes the doneness color (doneness.slang) for one temperature across the whole model, once
+// any time has passed. There is no voxel grid.
 // The swapchain is sRGB, so the output stays linear and the display encode happens at present.
-// b* stays at the texture's original value. The raw Lab is the texel's own.
+// The raw Lab is the texel's own.
 
 import lab_color;
-import cooking_kinetics;
+import doneness;
 
 struct VSInput {
     float3 inPosition;
@@ -48,6 +48,6 @@ float4 fragMain(VSOutput vertIn) : SV_TARGET {
     float tF = ubo.cook.y;
     float seconds = ubo.cook.x;
     float tC = (tF - 32.0) * (5.0 / 9.0);
-    if (seconds > 0.0) lab = cookedLab(lab, stepCook(float4(1.0, 1.0, 1.0, 1.0), tC, seconds));
+    if (seconds > 0.0) lab = cookedLab(lab, tC);
     return float4(labToLinearSrgb(lab), sampled.a);
 }

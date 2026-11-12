@@ -9,10 +9,8 @@
 // Temperature-driven CIELAB color of the voxel grid.
 //
 // Lab is stored in RGBA16F 3D images: R = L*, G = a*, B = b*, A = 1 for CELL_SOLID and 0 otherwise.
-// An immutable copy keeps the raw Lab. Each heat step then advances the two-step cooking kinetics for
-// L* and a* (color_model.hpp) by one piecewise-constant step and writes the cooked Lab; b* is left as
-// initialized. The kinetics state (L* q, L* c, a* q, a* c) is kept in an RGBA32F 3D image so that
-// slow changes are not lost to half-float rounding.
+// An immutable copy keeps the raw Lab. Each heat step then raises every solid cell's peak temperature
+// (Celsius, an R32F 3D image) and writes the doneness color for that peak (color_model.hpp).
 //
 // Per-voxel UVs come from Voxelizer. Occupied voxels, including the interior, use the barycentric
 // UV of the closest point on the mesh. Interior voxels therefore inherit the nearest surface color
@@ -42,15 +40,15 @@ public:
     // Maps the export buffer. The queue that ran recordReadback must be idle.
     void download();
 
-    // Initializes from the texture, then runs one kinetics dispatch per temperature field.
+    // Initializes from the texture, then runs one color step per temperature field.
     // Each field is degrees Fahrenheit, one value per cell. Submits its own work and downloads.
     void runExplicitTemperatures(const std::vector<std::vector<float>>& temperatureSteps);
 
     const std::vector<glm::vec4>& lab() const { return labValues; }
     const std::vector<glm::vec3>& linearRgb() const { return rgbValues; }
     const std::vector<glm::vec3>& initialLinearRgb() const { return initialRgbValues; }
-    // (L*/L*_0, a*/a*_0) per cell from the kinetics state, exact rather than recovered from Lab.
-    const std::vector<glm::vec2>& cookRatio() const { return ratioValues; }
+    // Hottest temperature each cell reached, Celsius; kNoPeakCelsius where no step ran or the cell is not solid.
+    const std::vector<float>& peakCelsius() const { return peakValues; }
 
 private:
     struct GpuImage{
@@ -92,7 +90,7 @@ private:
     GpuImage albedo;
     GpuImage lab0;
     GpuImage labImage[2];
-    GpuImage cookState;
+    GpuImage peakImage;
     vk::raii::Buffer cellBuffer = nullptr;
     vk::raii::DeviceMemory cellMemory = nullptr;
     vk::raii::Buffer uvBuffer = nullptr;
@@ -101,8 +99,8 @@ private:
     vk::raii::DeviceMemory exportMemory = nullptr;
     vk::raii::Buffer initialExportBuffer = nullptr;
     vk::raii::DeviceMemory initialExportMemory = nullptr;
-    vk::raii::Buffer stateExportBuffer = nullptr;
-    vk::raii::DeviceMemory stateExportMemory = nullptr;
+    vk::raii::Buffer peakExportBuffer = nullptr;
+    vk::raii::DeviceMemory peakExportMemory = nullptr;
 
     glm::uvec3 dims{};
     float dt = 1.0f;
@@ -110,5 +108,5 @@ private:
     std::vector<glm::vec4> labValues;
     std::vector<glm::vec3> rgbValues;
     std::vector<glm::vec3> initialRgbValues;
-    std::vector<glm::vec2> ratioValues;
+    std::vector<float> peakValues;
 };

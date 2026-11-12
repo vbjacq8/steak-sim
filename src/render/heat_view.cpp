@@ -200,6 +200,7 @@ bool hasSurface(const HeatSurface& surface){
 struct GridFrame{
     glm::vec3 origin{};
     float voxelSize = 1.0f;
+    float midZ = 0.0f;  // model-space height halfway up the mesh; splits the pan side from the top
 };
 
 // Same corner the voxelizer uses, so a model-space point lands in the cell the blocks draw for that index.
@@ -211,7 +212,7 @@ GridFrame gridFrame(const HeatGrid& grid, const HeatSurface& surface){
         high = glm::max(high, point);
     }
     const VoxelGrid layout = makeVoxelGridLayout(low, high, grid.spacing / surface.metersPerUnit);
-    return {layout.origin, layout.voxelSize};
+    return {layout.origin, layout.voxelSize, 0.5f * (low.z + high.z)};
 }
 
 Eigen::Vector3d sampleVoxel(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position, float coldTemp, float hotTemp,
@@ -274,14 +275,22 @@ bool hasAlbedo(const HeatSurface& surface){
            surface.texcoords.size() == surface.positions.size();
 }
 
+// Meshes often map their top and bottom faces onto the same texels, so one texture could not cook the
+// pan side differently from the top. The drawn albedo holds two copies side by side: the left page for
+// triangles above GridFrame::midZ, the right page for those below it.
+constexpr int kAlbedoPages = 2;
+
+bool belowMid(const GridFrame& frame, float z){ return z < frame.midZ; }
+
 std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
     if (!hasAlbedo(surface)) return nullptr;
     auto image = std::make_shared<open3d::geometry::Image>();
-    image->Prepare(surface.width, surface.height, 3, 1);
+    const int width = surface.width * kAlbedoPages;
+    image->Prepare(width, surface.height, 3, 1);
     for (int y = 0; y < surface.height; ++y){
-        for (int x = 0; x < surface.width; ++x){
-            const size_t src = (static_cast<size_t>(y) * surface.width + x) * 4;
-            const size_t dst = (static_cast<size_t>(y) * surface.width + x) * 3;
+        for (int x = 0; x < width; ++x){
+            const size_t src = (static_cast<size_t>(y) * surface.width + x % surface.width) * 4;
+            const size_t dst = (static_cast<size_t>(y) * width + x) * 3;
             image->data_[dst] = surface.rgba[src];
             image->data_[dst + 1] = surface.rgba[src + 1];
             image->data_[dst + 2] = surface.rgba[src + 2];
@@ -306,42 +315,47 @@ bool isSurfaceCell(const HeatGrid& grid, int x, int y, int z){
     return false;
 }
 
-// Photo-resolution cook. Each surface voxel contributes its (L*/L*_0, a*/a*_0) at the texel it sampled,
-// and every texel is cooked from its own Lab with the nearest ratios, the same formula as the voxels.
-// Marbling stays the albedo's instead of being smeared across voxels.
+// Photo-resolution cook. Each surface voxel contributes its peak temperature at the texel it sampled,
+// on the albedo page for its side of the mesh, and every texel is cooked from its own Lab with the
+// nearest peak on its page, the same doneness table as the voxels. Marbling stays the albedo's instead
+// of being smeared across voxels.
 std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, const HeatSurface& surface){
     auto image = makeAlbedo(surface);
-    if (!image || grid.cookRatio.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
-    const int width = surface.width;
+    if (!image || grid.peakCelsius.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
+    const GridFrame frame = gridFrame(grid, surface);
+    const int pageWidth = surface.width;
+    const int width = pageWidth * kAlbedoPages;
     const int height = surface.height;
     const size_t texels = static_cast<size_t>(width) * height;
-    std::vector<glm::vec2> ratioSum(texels, glm::vec2(0.0f));
-    std::vector<float> ratioWeight(texels, 0.0f);
+    std::vector<float> peakSum(texels, 0.0f);
+    std::vector<float> peakWeight(texels, 0.0f);
     for (int z = 0; z < static_cast<int>(grid.dims.z); ++z){
         for (int y = 0; y < static_cast<int>(grid.dims.y); ++y){
             for (int x = 0; x < static_cast<int>(grid.dims.x); ++x){
                 if (!isSurfaceCell(grid, x, y, z)) continue;
                 const glm::vec2 uv = grid.sampleUv[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
                 if (uv.x < 0.0f || uv.y < 0.0f || uv.x > 1.0f || uv.y > 1.0f) continue;
-                const int px = std::clamp(static_cast<int>(std::lround(uv.x * (width - 1))), 0, width - 1);
+                const float centerZ = frame.origin.z + (static_cast<float>(z) + 0.5f) * frame.voxelSize;
+                const int page = belowMid(frame, centerZ) ? 1 : 0;
+                const int px = std::clamp(static_cast<int>(std::lround(uv.x * (pageWidth - 1))), 0, pageWidth - 1) + page * pageWidth;
                 const int py = std::clamp(static_cast<int>(std::lround(uv.y * (height - 1))), 0, height - 1);
                 const size_t texel = static_cast<size_t>(py) * width + px;
-                ratioSum[texel] += grid.cookRatio[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
-                ratioWeight[texel] += 1.0f;
+                peakSum[texel] += grid.peakCelsius[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
+                peakWeight[texel] += 1.0f;
             }
         }
     }
 
     constexpr int kMaxSpread = 64;
     std::vector<int> distance(texels, kMaxSpread + 1);
-    std::vector<glm::vec2> ratio(texels, glm::vec2(1.0f));
+    std::vector<float> peak(texels, kNoPeakCelsius);
     std::queue<std::pair<int, int>> wave;
     for (int y = 0; y < height; ++y){
         for (int x = 0; x < width; ++x){
             const size_t texel = static_cast<size_t>(y) * width + x;
-            if (!(ratioWeight[texel] > 0.0f)) continue;
+            if (!(peakWeight[texel] > 0.0f)) continue;
             distance[texel] = 0;
-            ratio[texel] = ratioSum[texel] / ratioWeight[texel];
+            peak[texel] = peakSum[texel] / peakWeight[texel];
             wave.emplace(x, y);
         }
     }
@@ -355,11 +369,11 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
         for (const auto& step : neighbor){
             const int nx = x + step[0];
             const int ny = y + step[1];
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+            if (nx < 0 || ny < 0 || nx >= width || ny >= height || nx / pageWidth != x / pageWidth) continue;
             const size_t nextTexel = static_cast<size_t>(ny) * width + nx;
             if (distance[nextTexel] <= next) continue;
             distance[nextTexel] = next;
-            ratio[nextTexel] = ratio[texel];
+            peak[nextTexel] = peak[texel];
             wave.emplace(nx, ny);
         }
     }
@@ -368,7 +382,7 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
         if (distance[texel] > kMaxSpread) continue;
         const size_t byte = texel * 3;
         const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
-        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), ratio[texel]);
+        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), peak[texel]);
         const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
         image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
         image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));
@@ -400,6 +414,9 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
         if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
         if (!inSlice(surface.positions[ids[0]]) && !inSlice(surface.positions[ids[1]]) && !inSlice(surface.positions[ids[2]])) continue;
         Eigen::Vector3i triangle;
+        const float centroidZ =
+            (surface.positions[ids[0]].z + surface.positions[ids[1]].z + surface.positions[ids[2]].z) / 3.0f;
+        const float page = belowMid(frame, centroidZ) ? 1.0f : 0.0f;
         for (int corner = 0; corner < 3; ++corner){
             int& slot = remap[ids[corner]];
             if (slot < 0){
@@ -412,7 +429,7 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
             triangle[corner] = slot;
             if (textured){
                 const glm::vec2 uv = surface.texcoords[ids[corner]];
-                mesh.triangle_uvs_.emplace_back(uv.x, uv.y);
+                mesh.triangle_uvs_.emplace_back((uv.x + page) / kAlbedoPages, uv.y);
             }
         }
         mesh.triangles_.push_back(triangle);

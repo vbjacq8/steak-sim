@@ -35,18 +35,6 @@ float channelError(glm::vec3 a, glm::vec3 b){
     return std::max(std::abs(a.x - b.x), std::max(std::abs(a.y - b.y), std::abs(a.z - b.z)));
 }
 
-CookState simulateRamp(float dt, float totalSeconds){
-    const int steps = static_cast<int>(std::lround(totalSeconds / dt));
-    CookState state;
-    for (int i = 0; i < steps; ++i){
-        const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(steps);
-        const float celsius = 30.0f + u * 60.0f;
-        const float fahrenheit = celsius * 9.0f / 5.0f + 32.0f;
-        state = stepCook(state, fahrenheit, dt);
-    }
-    return state;
-}
-
 TEST(ColorModel, LabRoundTrip){
     const glm::vec3 white = linearSrgbToLab({1.0f, 1.0f, 1.0f});
     EXPECT_NEAR(white.x, 100.0f, 1e-3f);
@@ -63,94 +51,54 @@ TEST(ColorModel, LabRoundTrip){
     }
 }
 
-TEST(ColorModel, KineticsTableInterpolation){
-    const KineticsParams cold = rednessParams(44.9f);
-    EXPECT_EQ(cold.k1, 0.0f);
-    EXPECT_EQ(cold.k2, 0.0f);
-    EXPECT_EQ(rednessParams(std::nanf("")).k2, 0.0f);
-    EXPECT_EQ(lightnessParams(29.9f).k1, 0.0f);
-    EXPECT_FLOAT_EQ(lightnessParams(35.0f).k1, 0.5f * (0.0014f + 0.0027f));
+TEST(ColorModel, DonenessTableInterpolation){
+    EXPECT_EQ(donenessAt(39.9f).strength, 0.0f);
+    EXPECT_EQ(donenessAt(kNoPeakCelsius).strength, 0.0f);
+    EXPECT_EQ(donenessAt(std::nanf("")).strength, 0.0f);
 
-    const KineticsParams at60 = rednessParams(60.0f);
-    EXPECT_FLOAT_EQ(at60.n, 0.7669f);
-    EXPECT_FLOAT_EQ(at60.m, 3.8473f);
-    EXPECT_FLOAT_EQ(at60.k1, 0.0037f);
-    EXPECT_FLOAT_EQ(at60.k2, 0.0328f);
-
-    const KineticsParams at65 = rednessParams(65.0f);
-    EXPECT_FLOAT_EQ(at65.n, 0.5f * (0.7669f + 0.7820f));
-    EXPECT_FLOAT_EQ(at65.k2, 0.5f * (0.0328f + 0.0451f));
-
-    const KineticsParams at90 = rednessParams(90.0f);
-    const KineticsParams hot = rednessParams(400.0f);
-    EXPECT_FLOAT_EQ(at90.n, 0.7866f);
-    EXPECT_FLOAT_EQ(hot.n, at90.n);
-    EXPECT_FLOAT_EQ(hot.m, at90.m);
-    EXPECT_FLOAT_EQ(hot.k1, at90.k1);
-    EXPECT_FLOAT_EQ(hot.k2, at90.k2);
-    EXPECT_FLOAT_EQ(lightnessParams(400.0f).n, 1.4172f);
-}
-
-TEST(ColorModel, NothingChangesBelowTheTables){
-    CookState below;
-    for (int i = 0; i < 600; ++i) below = stepCook(below, 85.0f, 1.0f);
-    EXPECT_EQ(below.lightness.ratio, 1.0f);
-    EXPECT_EQ(below.lightness.reactant, 1.0f);
-    EXPECT_EQ(below.redness.ratio, 1.0f);
-    EXPECT_EQ(below.redness.reactant, 1.0f);
-}
-
-TEST(ColorModel, LightnessRisesAndLevelsOff){
-    // Up to 55 C there is no second reaction, so L* rises to 1 + m and stays.
-    EXPECT_NEAR(lightnessRatioAt(50.0f, 1800.0f), 1.0f + 0.3095f, 1e-3f);
-    EXPECT_LT(lightnessRatioAt(50.0f, 60.0f), 1.1f);
-
-    // At 70 C L* overshoots within a minute, then settles at n.
-    float peak = 1.0f;
-    for (float seconds = 1.0f; seconds <= 120.0f; seconds += 1.0f) peak = std::max(peak, lightnessRatioAt(70.0f, seconds));
-    EXPECT_GT(peak, 1.45f);
-    EXPECT_NEAR(lightnessRatioAt(70.0f, 1800.0f), 1.4320f, 0.01f);
-
-    const glm::vec3 raw{45.0f, 13.55f, 12.92f};
-    CookState done;
-    for (int i = 0; i < 600; ++i) done = stepCook(done, 176.0f, 1.0f);
-    const glm::vec3 cooked = cookedLab(raw, done);
-    EXPECT_GT(cooked.x, 60.0f);
-    EXPECT_LT(cooked.y, raw.y);
-    EXPECT_EQ(cooked.z, raw.z);
-    EXPECT_EQ(cookedLab({90.0f, 0.0f, 0.0f}, done).x, 100.0f);
-}
-
-TEST(ColorModel, RednessRisesThenFallsTowardEquilibrium){
-    // At 80 C a* briefly rises above raw, then drops toward n.
-    float peak = 1.0f;
-    for (float seconds = 1.0f; seconds <= 120.0f; seconds += 1.0f) peak = std::max(peak, rednessRatioAt(80.0f, seconds));
-    EXPECT_GT(peak, 1.03f);
-    EXPECT_LT(peak, 1.2f);
-    EXPECT_NEAR(rednessRatioAt(80.0f, 1800.0f), rednessParams(80.0f).n, 0.02f);
-    EXPECT_LT(rednessRatioAt(80.0f, 600.0f), 0.85f);
-}
-
-TEST(ColorModel, ConstantTemperatureStepsMatchClosedForm){
-    for (float celsius : {35.0f, 45.0f, 52.0f, 60.0f, 75.0f, 90.0f}){
-        KineticsState lightness;
-        KineticsState redness;
-        for (int i = 0; i < 300; ++i){
-            lightness = stepKinetics(lightness, lightnessParams(celsius), 2.0f);
-            redness = stepKinetics(redness, rednessParams(celsius), 2.0f);
-        }
-        EXPECT_NEAR(lightness.ratio, lightnessRatioAt(celsius, 600.0f), 1e-4f) << celsius;
-        EXPECT_NEAR(redness.ratio, rednessRatioAt(celsius, 600.0f), 1e-4f) << celsius;
+    for (const DonenessKey& key : kDonenessKeys){
+        const Doneness d = donenessAt(key.celsius);
+        EXPECT_FLOAT_EQ(d.strength, key.strength) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.x, key.lab.x) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.y, key.lab.y) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.z, key.lab.z) << key.celsius;
     }
+
+    const Doneness between = donenessAt(0.5f * (kDonenessKeys[2].celsius + kDonenessKeys[3].celsius));
+    EXPECT_FLOAT_EQ(between.strength, 0.5f * (kDonenessKeys[2].strength + kDonenessKeys[3].strength));
+    EXPECT_FLOAT_EQ(between.lab.x, 0.5f * (kDonenessKeys[2].lab.x + kDonenessKeys[3].lab.x));
+
+    const DonenessKey& last = kDonenessKeys[kDonenessKeyCount - 1];
+    const Doneness hot = donenessAt(400.0f);
+    EXPECT_FLOAT_EQ(hot.strength, last.strength);
+    EXPECT_FLOAT_EQ(hot.lab.x, last.lab.x);
+
+    for (int i = 1; i < kDonenessKeyCount; ++i) EXPECT_GT(kDonenessKeys[i].celsius, kDonenessKeys[i - 1].celsius);
+    // The zero-strength key shares the next key's color, so the blend never drifts toward another color.
+    EXPECT_EQ(kDonenessKeys[0].lab, kDonenessKeys[1].lab);
 }
 
-TEST(ColorModel, RampIsInsensitiveToTimestep){
-    const CookState fine = simulateRamp(0.1f, 600.0f);
-    const CookState coarse = simulateRamp(2.0f, 600.0f);
-    EXPECT_LT(fine.redness.ratio, 0.95f);
-    EXPECT_GT(fine.lightness.ratio, 1.2f);
-    EXPECT_NEAR(coarse.redness.ratio, fine.redness.ratio, 2e-3f);
-    EXPECT_NEAR(coarse.lightness.ratio, fine.lightness.ratio, 2e-3f);
+TEST(ColorModel, CookedLabGoesFromRedToBrown){
+    const glm::vec3 raw{52.8f, 41.2f, 27.0f};
+    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius), raw);
+    EXPECT_EQ(cookedLab(raw, 30.0f), raw);
+
+    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f));
+    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f));
+    const glm::vec3 crust = cookedLab(raw, 170.0f);
+    EXPECT_LT(rare.y, raw.y);
+    EXPECT_LT(wellDone.y, rare.y - 10.0f);
+    EXPECT_GT(wellDone.x, rare.x);
+    EXPECT_LT(crust.x, wellDone.x);
+    EXPECT_LT(crust.y, wellDone.y);
+    EXPECT_LT(channelError(crust, kDonenessKeys[kDonenessKeyCount - 1].lab), 1e-4f);
+}
+
+TEST(ColorModel, PeakOnlyRises){
+    float peak = kNoPeakCelsius;
+    for (float fahrenheit : {70.0f, 150.0f, 300.0f, 200.0f, 90.0f}) peak = raisePeak(peak, fahrenheit);
+    EXPECT_FLOAT_EQ(peak, fahrenheitToCelsius(300.0f));
+    EXPECT_FLOAT_EQ(raisePeak(peak, std::nanf("")), peak);
 }
 
 std::vector<uint8_t> texel(uint8_t r, uint8_t g, uint8_t b){
@@ -197,14 +145,16 @@ TEST(ColorSolver, InitMatchesTextureLab){
     EXPECT_NEAR(solver.linearRgb()[4].x, 0.0f, 1e-3f);
 }
 
-TEST(ColorSolver, GpuKineticsMatchesCpu){
+TEST(ColorSolver, GpuColorMatchesCpu){
     REQUIRE_VULKAN();
     const std::vector<uint8_t> image = texel(255, 0, 0);
     const glm::uvec3 dims{2, 1, 1};
     const std::vector<uint32_t> cells{CELL_SOLID, CELL_AIR};
     const std::vector<glm::vec2> uv{{0.25f, 0.25f}, {0.25f, 0.25f}};
+    // Heats to 320 F (160 C), then cools; the color must keep the peak.
     std::vector<float> schedule;
-    for (int i = 0; i < 150; ++i) schedule.push_back(70.0f + 250.0f * static_cast<float>(i) / 149.0f);
+    for (int i = 0; i < 100; ++i) schedule.push_back(70.0f + 250.0f * static_cast<float>(i) / 99.0f);
+    for (int i = 1; i <= 50; ++i) schedule.push_back(320.0f - 220.0f * static_cast<float>(i) / 50.0f);
     constexpr float dt = 2.0f;
 
     ColorSolver initial = makeSolver();
@@ -218,18 +168,17 @@ TEST(ColorSolver, GpuKineticsMatchesCpu){
     solved.prepareGrid(dims, cells, uv, image.data(), 2, 2, dt);
     solved.runExplicitTemperatures(fields);
 
-    CookState state;
-    for (float temperature : schedule) state = stepCook(state, temperature, dt);
-    const glm::vec3 expected = cookedLab(glm::vec3(lab0), state);
+    float peak = kNoPeakCelsius;
+    for (float temperature : schedule) peak = raisePeak(peak, temperature);
+    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak);
     EXPECT_NEAR(solved.lab()[0].x, expected.x, 0.25f);
     EXPECT_NEAR(solved.lab()[0].y, expected.y, 0.25f);
-    EXPECT_NEAR(solved.lab()[0].z, lab0.z, 0.08f);
-    EXPECT_GT(solved.lab()[0].x, lab0.x + 5.0f);
-    EXPECT_LT(solved.lab()[0].y, lab0.y - 0.5f);
-    ASSERT_EQ(solved.cookRatio().size(), 2u);
-    EXPECT_NEAR(solved.cookRatio()[0].x, state.lightness.ratio, 1e-4f);
-    EXPECT_NEAR(solved.cookRatio()[0].y, state.redness.ratio, 1e-4f);
-    EXPECT_EQ(solved.cookRatio()[1], glm::vec2(1.0f));
+    EXPECT_NEAR(solved.lab()[0].z, expected.z, 0.25f);
+    EXPECT_LT(solved.lab()[0].x, lab0.x - 10.0f);
+    EXPECT_LT(solved.lab()[0].y, 20.0f);
+    ASSERT_EQ(solved.peakCelsius().size(), 2u);
+    EXPECT_NEAR(solved.peakCelsius()[0], peak, 1e-3f);
+    EXPECT_EQ(solved.peakCelsius()[1], kNoPeakCelsius);
     EXPECT_NEAR(solved.lab()[1].w, 0.0f, 1e-3f);
     EXPECT_NEAR(glm::length(solved.linearRgb()[1]), 0.0f, 1e-3f);
 }
