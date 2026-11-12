@@ -4,17 +4,15 @@
 
 #include <cstdint>
 #include <string>
-#include <string_view>
 #include <vector>
 
-// File types loadMesh knows how to read. A new type is one enumerator, one
-// filename extension in meshFormatFromPath, and one loader behind loadMesh.
 enum class MeshFormat{
     Obj,
     Gltf,
 };
 
-// One glTF primitive after its node transform. `indices` still index the parent Mesh.
+// One glTF primitive after its node transform. `indices` still index the parent Mesh and stay
+// inside [vertexOffset, vertexOffset + vertexCount).
 struct MeshPart{
     std::string name;
     uint32_t vertexOffset = 0;
@@ -47,13 +45,7 @@ struct Mesh{
     std::vector<MeshMaterial> materials;
 };
 
-std::string_view meshFormatName(MeshFormat format);
-
-// Extension of `path`, compared case-insensitively. .gltf and .glb are both Gltf.
-MeshFormat meshFormatFromPath(std::string_view path);
-
-// `format` selects the loader. loadMesh(path) fills that argument from the filename.
-Mesh loadMesh(const std::string& path, MeshFormat format);
+// Picks the loader from the extension, case-insensitively: .obj, or .gltf / .glb.
 Mesh loadMesh(const std::string& path);
 
 // Drops a later part whose bounds cover at least 90% of an earlier part with the same material.

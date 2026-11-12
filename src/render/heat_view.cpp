@@ -105,7 +105,7 @@ std::shared_ptr<gui::ImageWidget> makeSwatch(const Eigen::Vector3d& color, int w
 }
 
 void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, glm::uvec3 cell, int axis, bool positive,
-                float coldTemp, float hotTemp, bool showCookedColor){
+                float coldTemp, float hotTemp, bool showCookedColor, bool showInitialColor){
     const int u = (axis + 1) % 3;
     const int v = (axis + 2) % 3;
     const double s = grid.spacing * MM_PER_M;
@@ -119,12 +119,14 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
     const std::array<std::array<double, 2>, 4> corners{{{lo[u], lo[v]}, {hi[u], lo[v]}, {hi[u], hi[v]}, {lo[u], hi[v]}}};
 
     const int base = static_cast<int>(blocks.vertices_.size());
-    const bool meat = showCookedColor && grid.color.size() == grid.cellCount() && grid.kind(cell.x, cell.y, cell.z) == CELL_SOLID;
+    const bool solid = grid.kind(cell.x, cell.y, cell.z) == CELL_SOLID;
+    const bool initial = showInitialColor && solid && grid.initialColor.size() == grid.cellCount();
+    const bool meat = !initial && showCookedColor && solid && grid.color.size() == grid.cellCount();
     Eigen::Vector3d color;
-    if (meat){
+    if (initial || meat){
         // Already linear sRGB from the Lab export. The heat-map stops are display values and get
         // linearized with pow(2.2); doing that again would darken the steak.
-        const glm::vec3 sample = grid.color[grid.index(cell.x, cell.y, cell.z)];
+        const glm::vec3 sample = (initial ? grid.initialColor : grid.color)[grid.index(cell.x, cell.y, cell.z)];
         auto channel = [](float value){ return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
         color = {channel(sample.x), channel(sample.y), channel(sample.z)};
     } else{
@@ -151,7 +153,8 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
 // Builds the block mesh for the current slice. Safe to call off the UI thread. `progress` is the fraction of
 // z-slices finished.
 open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis, int slice, bool showPan, float coldTemp,
-                                             float hotTemp, bool showCookedColor, const std::function<void(float)>& progress){
+                                             float hotTemp, bool showCookedColor, bool showInitialColor,
+                                             const std::function<void(float)>& progress){
     glm::uvec3 regionLo(0);
     glm::uvec3 regionHi = grid.dims - 1u;
     if (slice >= 0){
@@ -178,7 +181,9 @@ open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis
                     for (int side : {-1, 1}){
                         glm::ivec3 neighbor = cell;
                         neighbor[axis] += side;
-                        if (!drawn(neighbor)) appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp, showCookedColor);
+                        if (!drawn(neighbor)){
+                            appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp, showCookedColor, showInitialColor);
+                        }
                     }
                 }
             }
@@ -511,7 +516,7 @@ private:
     void rebuildView(){
         if (resetting) return;
         if (showVolume || !hasSurface(surface)){
-            blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, {});
+            blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, showInitialColor, {});
         } else{
             surfaceDraw = buildSurfaceMesh(grid, surface, sliceAxis, slice, coldTemp, hotTemp, showCookedColor);
         }
@@ -563,7 +568,24 @@ private:
     void setShowCookedColor(bool show){
         if (grid.color.size() != grid.cellCount() || showCookedColor == show) return;
         showCookedColor = show;
+        if (show && showInitialColor){
+            showInitialColor = false;
+            if (initialCheckbox) initialCheckbox->SetChecked(false);
+        }
         if (colorCheckbox) colorCheckbox->SetChecked(show);
+        rebuildView();
+    }
+
+    void setShowInitialColor(bool show){
+        if (grid.initialColor.size() != grid.cellCount() || showInitialColor == show) return;
+        showInitialColor = show;
+        if (show){
+            showCookedColor = false;
+            showVolume = true;
+            if (colorCheckbox) colorCheckbox->SetChecked(false);
+            if (volumeCheckbox) volumeCheckbox->SetChecked(true);
+        }
+        if (initialCheckbox) initialCheckbox->SetChecked(show);
         rebuildView();
     }
 
@@ -715,6 +737,10 @@ private:
             colorCheckbox->SetChecked(showCookedColor);
             colorCheckbox->SetOnChecked([this](bool checked){ setShowCookedColor(checked); });
             viewBody.AddChild(colorCheckbox);
+            initialCheckbox = std::make_shared<gui::Checkbox>("Initial texture");
+            initialCheckbox->SetChecked(showInitialColor);
+            initialCheckbox->SetOnChecked([this](bool checked){ setShowInitialColor(checked); });
+            viewBody.AddChild(initialCheckbox);
         }
         if (hasSurface(surface)){
             volumeCheckbox = std::make_shared<gui::Checkbox>("Voxel volume");
@@ -867,7 +893,10 @@ private:
         scroll->AddChild(meat);
 
         std::string helpText = "Drag to rotate, scroll to zoom\n Press 'X', 'Y', 'Z' to take slices along axes and move them with the arrow keys\n Press 'A' to toggle back to the full domain. \n Press 'P' to toggle pan.";
-        if (grid.color.size() == grid.cellCount()) helpText += "\n Press 'C' to toggle cooked color.";
+        if (grid.color.size() == grid.cellCount()){
+            helpText += "\n Press 'C' to toggle cooked color.";
+            helpText += "\n Press 'I' for the voxel volume of the texture before cooking.";
+        }
         if (hasSurface(surface)) helpText += "\n Press 'V' to toggle the voxel volume and the mesh.";
         auto help = std::make_shared<gui::Label>(helpText.c_str());
         help->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
@@ -911,11 +940,12 @@ private:
         const int sliceNow = slice;
         const bool pan = showPan;
         const bool cooked = showCookedColor;
+        const bool initial = showInitialColor;
         const float cold = coldTemp;
         const float hot = hotTemp;
         auto dialog = progressDialog;
         auto simulator = simulate;
-        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cooked, cold, hot, simulator](){
+        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cooked, initial, cold, hot, simulator](){
             int lastPercent = -1;
             auto report = [this, dialog, &lastPercent](float fraction){
                 const int percent = std::clamp(static_cast<int>(std::lround(fraction * 100.0f)), 0, 100);
@@ -927,7 +957,7 @@ private:
                 report(0.01f);
                 HeatGrid next = simulator(ran, ranSteps, [&](float fraction){ report(0.02f + 0.78f * fraction); });
                 auto mesh = std::make_shared<open3d::geometry::TriangleMesh>(
-                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, cooked, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
+                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, cooked, initial, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
                 auto gridPtr = std::make_shared<HeatGrid>(std::move(next));
                 auto applied = std::make_shared<HeatParams>(ran);
                 gui::Application::GetInstance().PostToMainThread(
@@ -1003,6 +1033,7 @@ private:
             case gui::KEY_A: setSlice(-1); return true;
             case gui::KEY_P: setShowPan(!showPan); return true;
             case gui::KEY_C: setShowCookedColor(!showCookedColor); return true;
+            case gui::KEY_I: setShowInitialColor(!showInitialColor); return true;
             case gui::KEY_V: setShowVolume(!showVolume); return true;
             default: return false;
         }
@@ -1022,6 +1053,7 @@ private:
     int slice = -1;
     bool showPan = true;
     bool showCookedColor = false;
+    bool showInitialColor = false;
     bool showVolume = true;
     bool resetting = false;
     bool progressArmed = false;
@@ -1038,6 +1070,7 @@ private:
     std::array<std::shared_ptr<gui::Label>, LEGEND_ROWS> legendLabels;
     std::shared_ptr<gui::Checkbox> panCheckbox;
     std::shared_ptr<gui::Checkbox> colorCheckbox;
+    std::shared_ptr<gui::Checkbox> initialCheckbox;
     std::shared_ptr<gui::Checkbox> volumeCheckbox;
     std::shared_ptr<gui::Label> axisLabel;
     std::shared_ptr<gui::Combobox> axisCombo;

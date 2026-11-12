@@ -58,6 +58,8 @@ struct HeatGrid{
     // Linear sRGB from the color simulation, one entry per cell. Empty when color is not run;
     // the viewer then keeps the temperature colors. Zero for cells that are not meat.
     std::vector<glm::vec3> color;
+    // Linear sRGB of the albedo sample before kinetics. Same indexing as color; empty when color is not run.
+    std::vector<glm::vec3> initialColor;
     // UV that seeded each cell from the albedo. (-1, -1) when the cell has none. Empty if color
     // was not run. Same indexing as color.
     std::vector<glm::vec2> sampleUv;

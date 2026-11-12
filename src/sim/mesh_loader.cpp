@@ -6,418 +6,159 @@
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include <tiny_obj_loader.h>
-
-#define TINYGLTF_NO_STB_IMAGE
-#define TINYGLTF_NO_STB_IMAGE_WRITE
-#define TINYGLTF_NO_EXTERNAL_IMAGE
-#define TINYGLTF_IMPLEMENTATION
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-literal-operator"
-#elif defined(__GNUC__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wdeprecated-literal-operator"
-#endif
-#include <tiny_gltf.h>
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#elif defined(__GNUC__)
-#pragma GCC diagnostic pop
-#endif
+#include <tiny_gltf_v3.h>
 
 #include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <stdexcept>
-#include <unordered_map>
+#include <tuple>
 
 namespace {
 
-// Add a row here and in kExtensions when MeshFormat gains a value.
-struct FormatDesc{
-    MeshFormat format;
-    const char* name;
-    Mesh (*load)(const std::string& path);
-};
-
-struct ExtensionDesc{
-    const char* extension;
-    MeshFormat format;
-};
-
-Mesh loadObj(const std::string& path);
-Mesh loadGltf(const std::string& path);
-
-const FormatDesc kFormats[] = {
-    {MeshFormat::Obj, "obj", loadObj},
-    {MeshFormat::Gltf, "gltf", loadGltf},
-};
-
-const ExtensionDesc kExtensions[] = {
-    {".obj", MeshFormat::Obj},
-    {".gltf", MeshFormat::Gltf},
-    {".glb", MeshFormat::Gltf},
-};
-
-const FormatDesc* describe(MeshFormat format){
-    for (const FormatDesc& desc : kFormats){
-        if (desc.format == format) return &desc;
-    }
-    return nullptr;
+[[noreturn]] void fail(const std::string& message){
+    throw std::runtime_error("loadMesh: " + message);
 }
-
-std::string lowerExtension(std::string_view path){
-    std::string ext = std::filesystem::path{std::string(path)}.extension().string();
-    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return ext;
-}
-
-void requireTriangles(const Mesh& mesh, const std::string& path){
-    if (mesh.positions.empty() || mesh.indices.size() < 3){
-        throw std::runtime_error("loadMesh: " + path + " has no triangles");
-    }
-    if (mesh.indices.size() % 3 != 0){
-        throw std::runtime_error("loadMesh: " + path + " is not a triangle list");
-    }
-    if (!mesh.texcoords.empty() && mesh.texcoords.size() != mesh.positions.size()){
-        throw std::runtime_error("loadMesh: texcoord count does not match the vertex count");
-    }
-    if (!mesh.normals.empty() && mesh.normals.size() != mesh.positions.size()){
-        throw std::runtime_error("loadMesh: normal count does not match the vertex count");
-    }
-    for (uint32_t index : mesh.indices){
-        if (index >= mesh.positions.size()) throw std::runtime_error("loadMesh: index out of range in " + path);
-    }
-}
-
-glm::vec2 objTexcoord(const tinyobj::attrib_t& attrib, int texcoordIndex){
-    const size_t i = static_cast<size_t>(texcoordIndex) * 2;
-    if (texcoordIndex < 0 || i + 1 >= attrib.texcoords.size()){
-        throw std::runtime_error("loadMesh: obj texcoord index is out of range");
-    }
-    return {attrib.texcoords[i], attrib.texcoords[i + 1]};
-}
-
-glm::vec3 objNormal(const tinyobj::attrib_t& attrib, int normalIndex){
-    const size_t i = static_cast<size_t>(normalIndex) * 3;
-    if (normalIndex < 0 || i + 2 >= attrib.normals.size()){
-        throw std::runtime_error("loadMesh: obj normal index is out of range");
-    }
-    return {attrib.normals[i], attrib.normals[i + 1], attrib.normals[i + 2]};
-}
-
-struct CornerKey{
-    int vertex = 0;
-    int texcoord = 0;
-    int normal = 0;
-    bool operator==(const CornerKey&) const = default;
-};
-
-struct CornerHash{
-    size_t operator()(const CornerKey& key) const{
-        size_t h = std::hash<int>{}(key.vertex);
-        h ^= std::hash<int>{}(key.texcoord) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(key.normal) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
 
 // Positions stay in the OBJ vertex order so unreferenced vertices still contribute to the bounds.
-// A corner is split only when the same position index is reused with a different texcoord or normal.
+// The first corner to use a position claims its slot; a later corner with a different texcoord or normal gets a copy.
 Mesh loadObj(const std::string& path){
     tinyobj::attrib_t attrib;
     std::vector<tinyobj::shape_t> shapes;
     std::vector<tinyobj::material_t> materials;
     std::string warn, err;
-    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())){
-        const std::string message = warn + err;
-        throw std::runtime_error(message.empty() ? "loadMesh: failed to read " + path : message);
-    }
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str())) fail(path + ": " + warn + err);
 
-    Mesh mesh;
+    Mesh mesh{.format = MeshFormat::Obj};
     for (size_t i = 0; i + 2 < attrib.vertices.size(); i += 3){
         mesh.positions.push_back({attrib.vertices[i], attrib.vertices[i + 1], attrib.vertices[i + 2]});
     }
     const size_t vertexCount = mesh.positions.size();
-    const bool trackTex = !attrib.texcoords.empty();
-    const bool trackNormal = !attrib.normals.empty();
-    if (trackTex) mesh.texcoords.assign(vertexCount, {});
-    if (trackNormal) mesh.normals.assign(vertexCount, {});
+    const bool hasUv = !attrib.texcoords.empty();
+    const bool hasNormal = !attrib.normals.empty();
+    if (hasUv) mesh.texcoords.resize(vertexCount);
+    if (hasNormal) mesh.normals.resize(vertexCount);
 
-    std::vector<char> texBound(vertexCount, 0);
-    std::vector<char> normalBound(vertexCount, 0);
-    std::vector<int> boundTex(vertexCount, -1);
-    std::vector<int> boundNormal(vertexCount, -1);
-    std::unordered_map<CornerKey, uint32_t, CornerHash> splits;
-
-    const auto corner = [&](const tinyobj::index_t& index){
-        if (index.vertex_index < 0 || static_cast<size_t>(index.vertex_index) >= vertexCount){
-            throw std::runtime_error("loadMesh: obj vertex index is out of range");
-        }
-        const int vertex = index.vertex_index;
-        const int texcoord = index.texcoord_index;
-        const int normal = index.normal_index;
-        const glm::vec2 uv = trackTex && texcoord >= 0 ? objTexcoord(attrib, texcoord) : glm::vec2(0.0f);
-        const glm::vec3 nrm = trackNormal && normal >= 0 ? objNormal(attrib, normal) : glm::vec3(0.0f);
-
-        const bool newTex = trackTex && !texBound[vertex];
-        const bool newNormal = trackNormal && !normalBound[vertex];
-        if (newTex){
-            texBound[vertex] = 1;
-            boundTex[vertex] = texcoord;
-            mesh.texcoords[static_cast<size_t>(vertex)] = uv;
-        }
-        if (newNormal){
-            normalBound[vertex] = 1;
-            boundNormal[vertex] = normal;
-            mesh.normals[static_cast<size_t>(vertex)] = nrm;
-        }
-        const bool texConflict = trackTex && !newTex && boundTex[vertex] != texcoord;
-        const bool normalConflict = trackNormal && !newNormal && boundNormal[vertex] != normal;
-        if (!texConflict && !normalConflict){
-            mesh.indices.push_back(static_cast<uint32_t>(vertex));
-            return;
-        }
-
-        const CornerKey key{vertex, texcoord, normal};
-        const auto found = splits.find(key);
-        if (found != splits.end()){
-            mesh.indices.push_back(found->second);
-            return;
-        }
-        if (mesh.positions.size() > std::numeric_limits<uint32_t>::max()){
-            throw std::runtime_error("loadMesh: too many vertices in " + path);
-        }
-        const auto id = static_cast<uint32_t>(mesh.positions.size());
-        const glm::vec3 position = mesh.positions[static_cast<size_t>(vertex)];
-        mesh.positions.push_back(position);
-        if (trackTex) mesh.texcoords.push_back(uv);
-        if (trackNormal) mesh.normals.push_back(nrm);
-        splits.emplace(key, id);
-        mesh.indices.push_back(id);
-    };
-
+    std::vector<char> claimed(vertexCount, 0);
+    std::map<std::tuple<int, int, int>, uint32_t> corners;
     for (const tinyobj::shape_t& shape : shapes){
-        if (shape.mesh.num_face_vertices.empty()){
-            if (shape.mesh.indices.size() % 3 != 0){
-                throw std::runtime_error("loadMesh: obj face is not a triangle in " + path);
+        for (const tinyobj::index_t& index : shape.mesh.indices){
+            const int v = index.vertex_index, t = index.texcoord_index, n = index.normal_index;
+            if (v < 0 || static_cast<size_t>(v) >= vertexCount) fail("obj vertex index is out of range in " + path);
+            const auto [it, added] = corners.try_emplace({v, t, n}, static_cast<uint32_t>(v));
+            if (added && claimed[v]){
+                it->second = static_cast<uint32_t>(mesh.positions.size());
+                const glm::vec3 position = mesh.positions[v];
+                mesh.positions.push_back(position);
+                if (hasUv) mesh.texcoords.emplace_back();
+                if (hasNormal) mesh.normals.emplace_back();
             }
-            for (const tinyobj::index_t& index : shape.mesh.indices) corner(index);
-            continue;
-        }
-        size_t offset = 0;
-        for (unsigned faceVerts : shape.mesh.num_face_vertices){
-            if (faceVerts != 3 || offset + faceVerts > shape.mesh.indices.size()){
-                throw std::runtime_error("loadMesh: obj face is not a triangle in " + path);
+            if (added){
+                claimed[v] = 1;
+                if (hasUv && t >= 0) mesh.texcoords[it->second] = {attrib.texcoords.at(2 * t), attrib.texcoords.at(2 * t + 1)};
+                if (hasNormal && n >= 0){
+                    mesh.normals[it->second] = {attrib.normals.at(3 * n), attrib.normals.at(3 * n + 1), attrib.normals.at(3 * n + 2)};
+                }
             }
-            corner(shape.mesh.indices[offset]);
-            corner(shape.mesh.indices[offset + 1]);
-            corner(shape.mesh.indices[offset + 2]);
-            offset += faceVerts;
+            mesh.indices.push_back(it->second);
         }
     }
     return mesh;
 }
 
-struct Packed{
-    const unsigned char* data = nullptr;
-    size_t stride = 0;
-    size_t count = 0;
-    int componentType = 0;
-    bool normalized = false;
-};
-
-Packed accessorPacked(const tinygltf::Model& model, int index, int expectType){
-    if (index < 0 || static_cast<size_t>(index) >= model.accessors.size()){
-        throw std::runtime_error("loadMesh: glTF accessor index is out of range");
-    }
-    const tinygltf::Accessor& accessor = model.accessors[static_cast<size_t>(index)];
-    if (accessor.sparse.isSparse) throw std::runtime_error("loadMesh: sparse glTF accessors are not supported");
-    if (accessor.type != expectType) throw std::runtime_error("loadMesh: glTF accessor has an unexpected type");
-    if (accessor.bufferView < 0 || static_cast<size_t>(accessor.bufferView) >= model.bufferViews.size()){
-        throw std::runtime_error("loadMesh: glTF accessor is missing a buffer view");
-    }
-    const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(accessor.bufferView)];
-    if (view.buffer < 0 || static_cast<size_t>(view.buffer) >= model.buffers.size()){
-        throw std::runtime_error("loadMesh: glTF buffer view is missing a buffer");
-    }
-    const tinygltf::Buffer& buffer = model.buffers[static_cast<size_t>(view.buffer)];
-    const int compSize = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(accessor.componentType));
-    const int components = tinygltf::GetNumComponentsInType(static_cast<uint32_t>(accessor.type));
-    if (compSize <= 0 || components <= 0){
-        throw std::runtime_error("loadMesh: glTF accessor has an unsupported component type");
-    }
-    const int tight = compSize * components;
-    const int stride = accessor.ByteStride(view);
-    if (stride < tight) throw std::runtime_error("loadMesh: glTF accessor stride is invalid");
-
-    const size_t start = view.byteOffset + accessor.byteOffset;
-    if (accessor.count > 0){
-        const size_t span = accessor.count - 1;
-        const auto step = static_cast<size_t>(stride);
-        const auto elem = static_cast<size_t>(tight);
-        if (start > buffer.data.size() || (step != 0 && span > (std::numeric_limits<size_t>::max() - elem) / step)){
-            throw std::runtime_error("loadMesh: glTF accessor runs past the end of its buffer");
-        }
-        const size_t end = start + span * step + elem;
-        if (end < start || end > buffer.data.size()){
-            throw std::runtime_error("loadMesh: glTF accessor runs past the end of its buffer");
-        }
-    }
-    return {buffer.data.data() + start, static_cast<size_t>(stride), accessor.count, accessor.componentType, accessor.normalized};
+std::string str(tg3_str s){
+    return s.data ? std::string(s.data, s.len) : std::string();
 }
 
-float componentAsFloat(const unsigned char* p, int componentType, bool normalized){
-    switch (componentType){
-        case TINYGLTF_COMPONENT_TYPE_FLOAT:{
-            float v;
-            std::memcpy(&v, p, sizeof(v));
-            return v;
-        }
-        case TINYGLTF_COMPONENT_TYPE_DOUBLE:{
-            double v;
-            std::memcpy(&v, p, sizeof(v));
-            return static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE:{
-            const auto v = *p;
-            return normalized ? static_cast<float>(v) / 255.0f : static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_BYTE:{
-            int8_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return normalized ? std::max(static_cast<float>(v) / 127.0f, -1.0f) : static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:{
-            uint16_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return normalized ? static_cast<float>(v) / 65535.0f : static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_SHORT:{
-            int16_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return normalized ? std::max(static_cast<float>(v) / 32767.0f, -1.0f) : static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:{
-            uint32_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return static_cast<float>(v);
-        }
-        case TINYGLTF_COMPONENT_TYPE_INT:{
-            int32_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return static_cast<float>(v);
-        }
-        default: throw std::runtime_error("loadMesh: glTF accessor has an unsupported component type");
+template <class T>
+T load(const uint8_t* p){
+    T v;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+// Float, or an integer type allowed by KHR_mesh_quantization.
+float component(const uint8_t* p, int32_t type, bool normalized){
+    switch (type){
+        case TG3_COMPONENT_TYPE_FLOAT: return load<float>(p);
+        case TG3_COMPONENT_TYPE_BYTE: return normalized ? std::max(load<int8_t>(p) / 127.0f, -1.0f) : load<int8_t>(p);
+        case TG3_COMPONENT_TYPE_UNSIGNED_BYTE: return normalized ? *p / 255.0f : *p;
+        case TG3_COMPONENT_TYPE_SHORT: return normalized ? std::max(load<int16_t>(p) / 32767.0f, -1.0f) : load<int16_t>(p);
+        case TG3_COMPONENT_TYPE_UNSIGNED_SHORT: return normalized ? load<uint16_t>(p) / 65535.0f : load<uint16_t>(p);
+        default: fail("glTF attribute has an unsupported component type");
     }
 }
 
-uint32_t componentAsIndex(const unsigned char* p, int componentType){
-    switch (componentType){
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_BYTE: return *p;
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_SHORT:{
-            uint16_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return v;
-        }
-        case TINYGLTF_COMPONENT_TYPE_UNSIGNED_INT:{
-            uint32_t v;
-            std::memcpy(&v, p, sizeof(v));
-            return v;
-        }
-        default: throw std::runtime_error("loadMesh: glTF indices must be unsigned integers");
-    }
+// The parser checks buffer views against byteLength, not against the bytes it actually loaded.
+const uint8_t* viewBytes(const tg3_model& model, int32_t index){
+    const tg3_buffer_view& view = model.buffer_views[index];
+    const tg3_span_u8& data = model.buffers[view.buffer].data;
+    if (view.byte_offset + view.byte_length > data.count) fail("glTF buffer data is missing");
+    return data.data + view.byte_offset;
 }
 
-std::vector<glm::vec3> readVec3(const tinygltf::Model& model, int accessor){
-    const Packed packed = accessorPacked(model, accessor, TINYGLTF_TYPE_VEC3);
-    const int compSize = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(packed.componentType));
-    std::vector<glm::vec3> out(packed.count);
-    for (size_t i = 0; i < packed.count; ++i){
-        const unsigned char* p = packed.data + i * packed.stride;
-        out[i] = {
-            componentAsFloat(p, packed.componentType, packed.normalized),
-            componentAsFloat(p + compSize, packed.componentType, packed.normalized),
-            componentAsFloat(p + 2 * compSize, packed.componentType, packed.normalized),
-        };
+// read(elementBytes) for each element. tg3_parse_file has already range-checked every index and byte span.
+template <class Read>
+auto readAccessor(const tg3_model& model, int32_t index, int32_t type, Read read){
+    const tg3_accessor& accessor = model.accessors[index];
+    if (accessor.type != type) fail("glTF accessor has an unexpected type");
+    if (accessor.sparse.is_sparse || accessor.buffer_view < 0) fail("sparse or buffer-less glTF accessors are not supported");
+    const uint8_t* data = viewBytes(model, accessor.buffer_view) + accessor.byte_offset;
+    const size_t stride = tg3_accessor_byte_stride(&accessor, &model.buffer_views[accessor.buffer_view]);
+    std::vector<decltype(read(data))> out(accessor.count);
+    for (size_t i = 0; i < out.size(); ++i) out[i] = read(data + i * stride);
+    return out;
+}
+
+// TG3_TYPE_VEC2 and TG3_TYPE_VEC3 equal their component counts.
+template <int N>
+std::vector<glm::vec<N, float>> readFloats(const tg3_model& model, int32_t index){
+    const tg3_accessor& accessor = model.accessors[index];
+    const int32_t size = tg3_component_size(accessor.component_type);
+    return readAccessor(model, index, N, [&](const uint8_t* p){
+        glm::vec<N, float> v;
+        for (int c = 0; c < N; ++c) v[c] = component(p + c * size, accessor.component_type, accessor.normalized);
+        return v;
+    });
+}
+
+std::vector<uint32_t> readIndices(const tg3_model& model, int32_t index){
+    const int32_t type = model.accessors[index].component_type;
+    return readAccessor(model, index, TG3_TYPE_SCALAR, [type](const uint8_t* p) -> uint32_t{
+        switch (type){
+            case TG3_COMPONENT_TYPE_UNSIGNED_BYTE: return *p;
+            case TG3_COMPONENT_TYPE_UNSIGNED_SHORT: return load<uint16_t>(p);
+            case TG3_COMPONENT_TYPE_UNSIGNED_INT: return load<uint32_t>(p);
+            default: fail("glTF indices must be unsigned integers");
+        }
+    });
+}
+
+std::vector<uint32_t> triangleList(const std::vector<uint32_t>& c, int32_t mode){
+    if (mode == TG3_MODE_TRIANGLES){
+        if (c.size() % 3 != 0) fail("glTF triangle index count is not a multiple of 3");
+        return c;
+    }
+    std::vector<uint32_t> out;
+    for (size_t i = 0; i + 2 < c.size(); ++i){
+        if (mode == TG3_MODE_TRIANGLE_FAN) out.insert(out.end(), {c[0], c[i + 1], c[i + 2]});
+        else if (i % 2 == 0) out.insert(out.end(), {c[i], c[i + 1], c[i + 2]});
+        else out.insert(out.end(), {c[i + 1], c[i], c[i + 2]});
     }
     return out;
 }
 
-std::vector<glm::vec2> readVec2(const tinygltf::Model& model, int accessor){
-    const Packed packed = accessorPacked(model, accessor, TINYGLTF_TYPE_VEC2);
-    const int compSize = tinygltf::GetComponentSizeInBytes(static_cast<uint32_t>(packed.componentType));
-    std::vector<glm::vec2> out(packed.count);
-    for (size_t i = 0; i < packed.count; ++i){
-        const unsigned char* p = packed.data + i * packed.stride;
-        out[i] = {
-            componentAsFloat(p, packed.componentType, packed.normalized),
-            componentAsFloat(p + compSize, packed.componentType, packed.normalized),
-        };
-    }
-    return out;
-}
-
-std::vector<uint32_t> readIndices(const tinygltf::Model& model, int accessor){
-    const Packed packed = accessorPacked(model, accessor, TINYGLTF_TYPE_SCALAR);
-    std::vector<uint32_t> out(packed.count);
-    for (size_t i = 0; i < packed.count; ++i){
-        out[i] = componentAsIndex(packed.data + i * packed.stride, packed.componentType);
-    }
-    return out;
-}
-
-void appendTriangles(std::vector<uint32_t>& indices, const std::vector<uint32_t>& corners, int mode, uint32_t base,
-                     uint32_t vertexCount){
-    if (vertexCount > 0 && base > std::numeric_limits<uint32_t>::max() - (vertexCount - 1)){
-        throw std::runtime_error("loadMesh: too many vertices");
-    }
-    const auto emit = [&](uint32_t a, uint32_t b, uint32_t c){
-        if (a >= vertexCount || b >= vertexCount || c >= vertexCount){
-            throw std::runtime_error("loadMesh: glTF index is out of range");
-        }
-        indices.push_back(base + a);
-        indices.push_back(base + b);
-        indices.push_back(base + c);
-    };
-    if (mode == TINYGLTF_MODE_TRIANGLES){
-        if (corners.size() % 3 != 0) throw std::runtime_error("loadMesh: glTF triangle index count is not a multiple of 3");
-        for (size_t i = 0; i < corners.size(); i += 3) emit(corners[i], corners[i + 1], corners[i + 2]);
-    } else if (mode == TINYGLTF_MODE_TRIANGLE_STRIP){
-        for (size_t i = 0; i + 2 < corners.size(); ++i){
-            if ((i % 2) == 0) emit(corners[i], corners[i + 1], corners[i + 2]);
-            else emit(corners[i + 1], corners[i], corners[i + 2]);
-        }
-    } else if (mode == TINYGLTF_MODE_TRIANGLE_FAN){
-        for (size_t i = 1; i + 1 < corners.size(); ++i) emit(corners[0], corners[i], corners[i + 1]);
-    }
-}
-
-glm::mat4 nodeMatrix(const tinygltf::Node& node){
-    if (node.matrix.size() == 16){
-        float m[16];
-        for (int i = 0; i < 16; ++i) m[i] = static_cast<float>(node.matrix[static_cast<size_t>(i)]);
-        return glm::make_mat4(m);
-    }
-    glm::vec3 translation(0.0f);
-    glm::vec3 scale(1.0f);
-    glm::quat rotation(1.0f, 0.0f, 0.0f, 0.0f);
-    if (node.translation.size() == 3){
-        translation = {static_cast<float>(node.translation[0]), static_cast<float>(node.translation[1]),
-                       static_cast<float>(node.translation[2])};
-    }
-    if (node.scale.size() == 3){
-        scale = {static_cast<float>(node.scale[0]), static_cast<float>(node.scale[1]), static_cast<float>(node.scale[2])};
-    }
-    if (node.rotation.size() == 4){
-        // glTF stores quaternions as xyzw. glm::quat takes wxyz.
-        rotation = glm::quat(static_cast<float>(node.rotation[3]), static_cast<float>(node.rotation[0]),
+glm::mat4 nodeMatrix(const tg3_node& node){
+    if (node.has_matrix) return glm::mat4(glm::make_mat4(node.matrix));
+    // glTF stores quaternions as xyzw. glm::quat takes wxyz.
+    const glm::quat rotation(static_cast<float>(node.rotation[3]), static_cast<float>(node.rotation[0]),
                              static_cast<float>(node.rotation[1]), static_cast<float>(node.rotation[2]));
-    }
-    return glm::translate(glm::mat4(1.0f), translation) * glm::mat4_cast(rotation) * glm::scale(glm::mat4(1.0f), scale);
+    return glm::translate(glm::mat4(1.0f), glm::vec3(glm::make_vec3(node.translation))) * glm::mat4_cast(rotation) *
+           glm::scale(glm::mat4(1.0f), glm::vec3(glm::make_vec3(node.scale)));
 }
 
 glm::mat3 normalMatrix(const glm::mat4& xform){
@@ -426,295 +167,167 @@ glm::mat3 normalMatrix(const glm::mat4& xform){
     return glm::transpose(glm::inverse(linear));
 }
 
-int attributeIndex(const tinygltf::Primitive& prim, const char* name){
-    const auto it = prim.attributes.find(name);
-    return it == prim.attributes.end() ? -1 : it->second;
+int32_t attribute(const tg3_primitive& prim, const char* name){
+    for (uint32_t i = 0; i < prim.attributes_count; ++i){
+        if (tg3_str_equals_cstr(prim.attributes[i].key, name)) return prim.attributes[i].value;
+    }
+    return -1;
 }
 
-void appendPrimitive(Mesh& mesh, const tinygltf::Model& model, const tinygltf::Primitive& prim, const glm::mat4& xform,
-                     const std::string& name){
-    if (prim.extensions.find("KHR_draco_mesh_compression") != prim.extensions.end()){
-        throw std::runtime_error("loadMesh: Draco-compressed glTF is not supported");
-    }
-    const int mode = prim.mode < 0 ? TINYGLTF_MODE_TRIANGLES : prim.mode;
-    if (mode != TINYGLTF_MODE_TRIANGLES && mode != TINYGLTF_MODE_TRIANGLE_STRIP && mode != TINYGLTF_MODE_TRIANGLE_FAN) return;
+struct GltfReader{
+    const tg3_model& model;
+    Mesh mesh;
+    bool hasUv = false;
+    bool hasNormal = false;
 
-    const int positionAccessor = attributeIndex(prim, "POSITION");
-    if (positionAccessor < 0) throw std::runtime_error("loadMesh: glTF primitive is missing POSITION");
-    const std::vector<glm::vec3> positions = readVec3(model, positionAccessor);
-    if (positions.empty()) return;
-    if (positions.size() > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("loadMesh: too many vertices");
-
-    const int uvAccessor = attributeIndex(prim, "TEXCOORD_0");
-    const int normalAccessor = attributeIndex(prim, "NORMAL");
-    std::vector<glm::vec2> uvs = uvAccessor >= 0 ? readVec2(model, uvAccessor) : std::vector<glm::vec2>{};
-    std::vector<glm::vec3> normals = normalAccessor >= 0 ? readVec3(model, normalAccessor) : std::vector<glm::vec3>{};
-    if (!uvs.empty() && uvs.size() != positions.size()){
-        throw std::runtime_error("loadMesh: glTF texcoord count does not match POSITION");
-    }
-    if (!normals.empty() && normals.size() != positions.size()){
-        throw std::runtime_error("loadMesh: glTF normal count does not match POSITION");
-    }
-
-    if (mesh.positions.size() > std::numeric_limits<uint32_t>::max()) throw std::runtime_error("loadMesh: too many vertices");
-    const auto base = static_cast<uint32_t>(mesh.positions.size());
-    const bool wantUv = !mesh.texcoords.empty() || !uvs.empty();
-    const bool wantNormal = !mesh.normals.empty() || !normals.empty();
-    if (wantUv && mesh.texcoords.empty()) mesh.texcoords.assign(base, {});
-    if (wantNormal && mesh.normals.empty()) mesh.normals.assign(base, {});
-
-    const glm::mat3 nmat = normalMatrix(xform);
-    for (const glm::vec3& position : positions){
-        mesh.positions.push_back(glm::vec3(xform * glm::vec4(position, 1.0f)));
-    }
-    if (wantUv){
-        if (uvs.empty()) mesh.texcoords.insert(mesh.texcoords.end(), positions.size(), {});
-        else mesh.texcoords.insert(mesh.texcoords.end(), uvs.begin(), uvs.end());
-    }
-    if (wantNormal){
-        if (normals.empty()){
-            mesh.normals.insert(mesh.normals.end(), positions.size(), {});
-        } else{
-            for (glm::vec3 normal : normals){
-                normal = nmat * normal;
-                const float len = glm::length(normal);
-                mesh.normals.push_back(len > 0.0f ? normal / len : glm::vec3(0.0f));
-            }
+    void primitive(const tg3_primitive& prim, const glm::mat4& xform, const std::string& name){
+        if (prim.mode != TG3_MODE_TRIANGLES && prim.mode != TG3_MODE_TRIANGLE_STRIP && prim.mode != TG3_MODE_TRIANGLE_FAN) return;
+        const int32_t positionAccessor = attribute(prim, "POSITION");
+        const int32_t uvAccessor = attribute(prim, "TEXCOORD_0");
+        const int32_t normalAccessor = attribute(prim, "NORMAL");
+        if (positionAccessor < 0) fail("glTF primitive is missing POSITION");
+        const std::vector<glm::vec3> positions = readFloats<3>(model, positionAccessor);
+        const auto uvs = uvAccessor >= 0 ? readFloats<2>(model, uvAccessor) : std::vector<glm::vec2>(positions.size());
+        const auto normals = normalAccessor >= 0 ? readFloats<3>(model, normalAccessor) : std::vector<glm::vec3>(positions.size());
+        if (uvs.size() != positions.size() || normals.size() != positions.size()){
+            fail("glTF attribute count does not match POSITION");
         }
-    }
 
-    std::vector<uint32_t> corners;
-    if (prim.indices >= 0) corners = readIndices(model, prim.indices);
-    else{
-        corners.resize(positions.size());
-        for (uint32_t i = 0; i < corners.size(); ++i) corners[i] = i;
-    }
-    const auto indexOffset = static_cast<uint32_t>(mesh.indices.size());
-    appendTriangles(mesh.indices, corners, mode, base, static_cast<uint32_t>(positions.size()));
-    if (mesh.indices.size() == indexOffset) return;
-    MeshPart part;
-    part.name = name;
-    part.vertexOffset = base;
-    part.vertexCount = static_cast<uint32_t>(positions.size());
-    part.indexOffset = indexOffset;
-    part.indexCount = static_cast<uint32_t>(mesh.indices.size() - indexOffset);
-    part.material = prim.material;
-    mesh.parts.push_back(part);
-}
+        std::vector<uint32_t> corners(positions.size());
+        if (prim.indices >= 0) corners = readIndices(model, prim.indices);
+        else std::iota(corners.begin(), corners.end(), 0u);
+        corners = triangleList(corners, prim.mode);
+        if (corners.empty()) return;
 
-void appendMesh(Mesh& mesh, const tinygltf::Model& model, const tinygltf::Mesh& gltfMesh, const glm::mat4& xform,
-                const std::string& name){
-    const std::string& partName = !name.empty() ? name : gltfMesh.name;
-    for (const tinygltf::Primitive& prim : gltfMesh.primitives) appendPrimitive(mesh, model, prim, xform, partName);
-}
-
-void appendNode(Mesh& mesh, const tinygltf::Model& model, int nodeIndex, const glm::mat4& parent, std::vector<int>& stack){
-    if (nodeIndex < 0 || static_cast<size_t>(nodeIndex) >= model.nodes.size()){
-        throw std::runtime_error("loadMesh: glTF node index is out of range");
-    }
-    if (std::find(stack.begin(), stack.end(), nodeIndex) != stack.end()){
-        throw std::runtime_error("loadMesh: glTF node hierarchy has a cycle");
-    }
-    stack.push_back(nodeIndex);
-    const tinygltf::Node& node = model.nodes[static_cast<size_t>(nodeIndex)];
-    const glm::mat4 world = parent * nodeMatrix(node);
-    if (node.mesh >= 0){
-        if (static_cast<size_t>(node.mesh) >= model.meshes.size()){
-            throw std::runtime_error("loadMesh: glTF mesh index is out of range");
+        const auto base = static_cast<uint32_t>(mesh.positions.size());
+        mesh.parts.push_back({.name = name, .vertexOffset = base, .vertexCount = static_cast<uint32_t>(positions.size()),
+                              .indexOffset = static_cast<uint32_t>(mesh.indices.size()),
+                              .indexCount = static_cast<uint32_t>(corners.size()), .material = prim.material});
+        for (uint32_t corner : corners){
+            if (corner >= positions.size()) fail("glTF index is out of range");
+            mesh.indices.push_back(base + corner);
         }
-        // Skinning and morph targets stay in the node's bind pose.
-        appendMesh(mesh, model, model.meshes[static_cast<size_t>(node.mesh)], world, node.name);
+        const glm::mat3 nmat = normalMatrix(xform);
+        for (size_t i = 0; i < positions.size(); ++i){
+            mesh.positions.push_back(glm::vec3(xform * glm::vec4(positions[i], 1.0f)));
+            const glm::vec3 normal = nmat * normals[i];
+            const float len = glm::length(normal);
+            mesh.normals.push_back(len > 0.0f ? normal / len : glm::vec3(0.0f));
+        }
+        mesh.texcoords.insert(mesh.texcoords.end(), uvs.begin(), uvs.end());
+        hasUv |= uvAccessor >= 0;
+        hasNormal |= normalAccessor >= 0;
     }
-    for (int child : node.children) appendNode(mesh, model, child, world, stack);
-    stack.pop_back();
-}
 
-bool fileStartsWithGlb(const std::string& path){
-    std::ifstream in(path, std::ios::binary);
-    char magic[4] = {};
-    in.read(magic, 4);
-    return in.gcount() == 4 && std::memcmp(magic, "glTF", 4) == 0;
-}
+    void addMesh(const tg3_mesh& gltfMesh, const glm::mat4& xform, const std::string& name){
+        for (uint32_t i = 0; i < gltfMesh.primitives_count; ++i) primitive(gltfMesh.primitives[i], xform, name);
+    }
+
+    // Skinning and morph targets stay in the node's bind pose.
+    void node(int32_t index, const glm::mat4& parent, uint32_t depth){
+        if (depth > model.nodes_count) fail("glTF node hierarchy has a cycle");
+        const tg3_node& n = model.nodes[index];
+        const glm::mat4 world = parent * nodeMatrix(n);
+        if (n.mesh >= 0){
+            const tg3_mesh& gltfMesh = model.meshes[n.mesh];
+            addMesh(gltfMesh, world, n.name.len ? str(n.name) : str(gltfMesh.name));
+        }
+        for (uint32_t i = 0; i < n.children_count; ++i) node(n.children[i], world, depth + 1);
+    }
+};
 
 Mesh loadGltf(const std::string& path){
-    tinygltf::TinyGLTF loader;
-    // Keep the PNG/JPEG bytes in the buffer. Pixels are decoded by the caller.
-    loader.SetImageLoader(
-        [](tinygltf::Image*, int, std::string*, std::string*, int, int, const unsigned char*, int, void*){ return true; },
-        nullptr);
-
-    tinygltf::Model model;
-    std::string err, warn;
-    const bool binary = fileStartsWithGlb(path);
-    bool ok = false;
-    try{
-        ok = binary ? loader.LoadBinaryFromFile(&model, &err, &warn, path)
-                    : loader.LoadASCIIFromFile(&model, &err, &warn, path);
-    } catch (const std::exception& e){
-        throw std::runtime_error(std::string("loadMesh: ") + e.what());
-    }
-    if (!ok){
-        const std::string message = warn + err;
-        throw std::runtime_error(message.empty() ? "loadMesh: failed to read " + path : message);
+    tg3_parse_options opts;
+    tg3_parse_options_init(&opts);
+    tinygltf3::Model gltf;
+    tinygltf3::ErrorStack errors;
+    if (tinygltf3::parse_file(gltf, errors, path.c_str(), &opts) != TG3_OK){
+        std::string message = "failed to read " + path;
+        for (uint32_t i = 0; i < errors.count(); ++i){
+            const tg3_error_entry* entry = errors.entry(i);
+            if (entry->severity == TG3_SEVERITY_ERROR && entry->message) message += std::string("; ") + entry->message;
+        }
+        fail(message);
     }
 
-    Mesh mesh;
-    std::vector<int> stack;
-    if (!model.scenes.empty()){
-        const int sceneIndex = model.defaultScene >= 0 ? model.defaultScene : 0;
-        if (sceneIndex < 0 || static_cast<size_t>(sceneIndex) >= model.scenes.size()){
-            throw std::runtime_error("loadMesh: glTF scene index is out of range");
-        }
-        for (int root : model.scenes[static_cast<size_t>(sceneIndex)].nodes){
-            appendNode(mesh, model, root, glm::mat4(1.0f), stack);
-        }
-    } else if (!model.nodes.empty()){
-        std::vector<char> isChild(model.nodes.size(), 0);
-        for (const tinygltf::Node& node : model.nodes){
-            for (int child : node.children){
-                if (child >= 0 && static_cast<size_t>(child) < isChild.size()) isChild[static_cast<size_t>(child)] = 1;
-            }
-        }
-        for (int i = 0; i < static_cast<int>(model.nodes.size()); ++i){
-            if (!isChild[static_cast<size_t>(i)]) appendNode(mesh, model, i, glm::mat4(1.0f), stack);
-        }
+    const tg3_model& model = *gltf.get();
+    GltfReader reader{.model = model, .mesh = {.format = MeshFormat::Gltf}};
+    if (model.scenes_count > 0){
+        const tg3_scene& scene = model.scenes[std::max(model.default_scene, 0)];
+        for (uint32_t i = 0; i < scene.nodes_count; ++i) reader.node(scene.nodes[i], glm::mat4(1.0f), 0);
     } else{
-        for (const tinygltf::Mesh& gltfMesh : model.meshes) appendMesh(mesh, model, gltfMesh, glm::mat4(1.0f), gltfMesh.name);
+        for (uint32_t i = 0; i < model.meshes_count; ++i) reader.addMesh(model.meshes[i], glm::mat4(1.0f), str(model.meshes[i].name));
     }
+    Mesh& mesh = reader.mesh;
+    if (!reader.hasUv) mesh.texcoords.clear();
+    if (!reader.hasNormal) mesh.normals.clear();
 
-    for (const tinygltf::Image& image : model.images){
-        MeshImage out;
-        out.name = image.name;
-        out.mimeType = image.mimeType;
-        if (image.bufferView >= 0 && static_cast<size_t>(image.bufferView) < model.bufferViews.size()){
-            const tinygltf::BufferView& view = model.bufferViews[static_cast<size_t>(image.bufferView)];
-            if (view.buffer >= 0 && static_cast<size_t>(view.buffer) < model.buffers.size()){
-                const tinygltf::Buffer& buffer = model.buffers[static_cast<size_t>(view.buffer)];
-                const size_t begin = view.byteOffset;
-                const size_t end = begin + view.byteLength;
-                if (end <= buffer.data.size()) out.encoded.assign(buffer.data.begin() + begin, buffer.data.begin() + end);
-            }
-        }
-        mesh.images.push_back(std::move(out));
+    for (uint32_t i = 0; i < model.images_count; ++i){
+        const tg3_image& image = model.images[i];
+        MeshImage& out = mesh.images.emplace_back(MeshImage{str(image.name), str(image.mime_type), {}});
+        if (image.buffer_view < 0) continue;
+        const uint8_t* bytes = viewBytes(model, image.buffer_view);
+        out.encoded.assign(bytes, bytes + model.buffer_views[image.buffer_view].byte_length);
     }
-    for (const tinygltf::Material& material : model.materials){
-        MeshMaterial out;
-        out.name = material.name;
-        const int texture = material.pbrMetallicRoughness.baseColorTexture.index;
-        if (texture >= 0 && static_cast<size_t>(texture) < model.textures.size()){
-            out.baseColorImage = model.textures[static_cast<size_t>(texture)].source;
-        }
-        mesh.materials.push_back(out);
+    for (uint32_t i = 0; i < model.materials_count; ++i){
+        const tg3_material& material = model.materials[i];
+        const int32_t texture = material.pbr_metallic_roughness.base_color_texture.index;
+        mesh.materials.push_back({str(material.name), texture >= 0 ? model.textures[texture].source : -1});
     }
-    return mesh;
+    return std::move(mesh);
 }
 
-}  // namespace
-
-namespace {
-
-float partVolume(glm::vec3 low, glm::vec3 high){
+float boxVolume(glm::vec3 low, glm::vec3 high){
     const glm::vec3 extent = glm::max(high - low, glm::vec3(0.0f));
     return extent.x * extent.y * extent.z;
-}
-
-float overlapRatio(glm::vec3 aLow, glm::vec3 aHigh, glm::vec3 bLow, glm::vec3 bHigh){
-    const float smaller = std::min(partVolume(aLow, aHigh), partVolume(bLow, bHigh));
-    if (!(smaller > 0.0f)) return 0.0f;
-    const glm::vec3 extent = glm::max(glm::min(aHigh, bHigh) - glm::max(aLow, bLow), glm::vec3(0.0f));
-    return extent.x * extent.y * extent.z / smaller;
-}
-
-void partBounds(const Mesh& mesh, const MeshPart& part, glm::vec3& low, glm::vec3& high){
-    low = glm::vec3(std::numeric_limits<float>::infinity());
-    high = glm::vec3(-std::numeric_limits<float>::infinity());
-    for (uint32_t i = 0; i < part.indexCount; ++i){
-        const uint32_t index = mesh.indices[part.indexOffset + i];
-        if (index >= mesh.positions.size()) continue;
-        low = glm::min(low, mesh.positions[index]);
-        high = glm::max(high, mesh.positions[index]);
-    }
 }
 
 }  // namespace
 
 Mesh dropOverlappingParts(Mesh mesh){
     if (mesh.parts.size() < 2) return mesh;
-    std::vector<glm::vec3> low(mesh.parts.size());
-    std::vector<glm::vec3> high(mesh.parts.size());
-    for (size_t i = 0; i < mesh.parts.size(); ++i) partBounds(mesh, mesh.parts[i], low[i], high[i]);
-
-    std::vector<char> keep(mesh.parts.size(), 1);
-    for (size_t i = 0; i < mesh.parts.size(); ++i){
-        for (size_t earlier = 0; earlier < i; ++earlier){
-            if (!keep[earlier] || mesh.parts[i].material != mesh.parts[earlier].material) continue;
-            if (overlapRatio(low[i], high[i], low[earlier], high[earlier]) > 0.9f){
-                keep[i] = 0;
-                break;
-            }
+    Mesh kept{.format = mesh.format, .images = mesh.images, .materials = mesh.materials};
+    std::vector<std::pair<glm::vec3, glm::vec3>> keptBounds;
+    for (const MeshPart& part : mesh.parts){
+        glm::vec3 low(std::numeric_limits<float>::infinity()), high(-low);
+        for (uint32_t i = 0; i < part.vertexCount; ++i){
+            low = glm::min(low, mesh.positions[part.vertexOffset + i]);
+            high = glm::max(high, mesh.positions[part.vertexOffset + i]);
         }
-    }
-    if (std::find(keep.begin(), keep.end(), char(0)) == keep.end()) return mesh;
+        const auto duplicates = [&](size_t k){
+            const auto [keptLow, keptHigh] = keptBounds[k];
+            const float smaller = std::min(boxVolume(low, high), boxVolume(keptLow, keptHigh));
+            return kept.parts[k].material == part.material && smaller > 0.0f &&
+                   boxVolume(glm::max(low, keptLow), glm::min(high, keptHigh)) > 0.9f * smaller;
+        };
+        bool duplicate = false;
+        for (size_t k = 0; k < kept.parts.size() && !duplicate; ++k) duplicate = duplicates(k);
+        if (duplicate) continue;
 
-    Mesh kept = mesh;
-    kept.positions.clear();
-    kept.normals.clear();
-    kept.texcoords.clear();
-    kept.indices.clear();
-    kept.parts.clear();
-    const bool hasUv = !mesh.texcoords.empty();
-    const bool hasNormal = !mesh.normals.empty();
-    std::vector<int> remap(mesh.positions.size(), -1);
-    for (size_t partIndex = 0; partIndex < mesh.parts.size(); ++partIndex){
-        if (!keep[partIndex]) continue;
-        const MeshPart& source = mesh.parts[partIndex];
-        MeshPart part = source;
-        part.vertexOffset = static_cast<uint32_t>(kept.positions.size());
-        part.indexOffset = static_cast<uint32_t>(kept.indices.size());
-        part.indexCount = 0;
-        std::fill(remap.begin(), remap.end(), -1);
-        for (uint32_t i = 0; i < source.indexCount; ++i){
-            const uint32_t index = mesh.indices[source.indexOffset + i];
-            if (index >= mesh.positions.size()) throw std::runtime_error("loadMesh: part index is out of range");
-            int& slot = remap[index];
-            if (slot < 0){
-                slot = static_cast<int>(kept.positions.size());
-                kept.positions.push_back(mesh.positions[index]);
-                if (hasUv) kept.texcoords.push_back(index < mesh.texcoords.size() ? mesh.texcoords[index] : glm::vec2(0.0f));
-                if (hasNormal) kept.normals.push_back(index < mesh.normals.size() ? mesh.normals[index] : glm::vec3(0.0f));
-            }
-            kept.indices.push_back(static_cast<uint32_t>(slot));
-            ++part.indexCount;
+        MeshPart& copy = kept.parts.emplace_back(part);
+        copy.vertexOffset = static_cast<uint32_t>(kept.positions.size());
+        copy.indexOffset = static_cast<uint32_t>(kept.indices.size());
+        keptBounds.emplace_back(low, high);
+        const auto vertices = [&](const auto& from, auto& to){
+            if (!from.empty()) to.insert(to.end(), from.begin() + part.vertexOffset, from.begin() + part.vertexOffset + part.vertexCount);
+        };
+        vertices(mesh.positions, kept.positions);
+        vertices(mesh.normals, kept.normals);
+        vertices(mesh.texcoords, kept.texcoords);
+        for (uint32_t i = 0; i < part.indexCount; ++i){
+            kept.indices.push_back(mesh.indices[part.indexOffset + i] - part.vertexOffset + copy.vertexOffset);
         }
-        part.vertexCount = static_cast<uint32_t>(kept.positions.size() - part.vertexOffset);
-        kept.parts.push_back(part);
     }
     return kept;
 }
 
-std::string_view meshFormatName(MeshFormat format){
-    const FormatDesc* desc = describe(format);
-    if (!desc) throw std::invalid_argument("loadMesh: unknown mesh format");
-    return desc->name;
-}
-
-MeshFormat meshFormatFromPath(std::string_view path){
-    const std::string ext = lowerExtension(path);
-    for (const ExtensionDesc& desc : kExtensions){
-        if (ext == desc.extension) return desc.format;
-    }
-    throw std::runtime_error("loadMesh: unsupported mesh extension \"" + ext + "\" for " + std::string(path));
-}
-
-Mesh loadMesh(const std::string& path, MeshFormat format){
-    const FormatDesc* desc = describe(format);
-    if (!desc) throw std::invalid_argument("loadMesh: unknown mesh format");
-    Mesh mesh = desc->load(path);
-    mesh.format = format;
-    requireTriangles(mesh, path);
-    return mesh;
-}
-
 Mesh loadMesh(const std::string& path){
-    return loadMesh(path, meshFormatFromPath(path));
+    std::string ext = std::filesystem::path(path).extension().string();
+    for (char& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    Mesh mesh;
+    if (ext == ".obj") mesh = loadObj(path);
+    else if (ext == ".gltf" || ext == ".glb") mesh = loadGltf(path);
+    else fail("unsupported mesh extension \"" + ext + "\" for " + path);
+    if (mesh.indices.empty() || mesh.indices.size() % 3 != 0) fail(path + " has no triangles");
+    return mesh;
 }

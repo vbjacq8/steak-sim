@@ -46,6 +46,7 @@ public:
 
     const std::vector<glm::vec4>& lab() const { return labValues; }
     const std::vector<glm::vec3>& linearRgb() const { return rgbValues; }
+    const std::vector<glm::vec3>& initialLinearRgb() const { return initialRgbValues; }
 
 private:
     struct GpuImage{
@@ -81,6 +82,7 @@ private:
     vk::raii::DescriptorSet initSet = nullptr;
     vk::raii::DescriptorSet kineticsSet[2] = {nullptr, nullptr};
     vk::raii::DescriptorSet exportSet[2] = {nullptr, nullptr};
+    vk::raii::DescriptorSet exportInitialSet = nullptr;
     vk::raii::Sampler albedoSampler = nullptr;
 
     GpuImage albedo;
@@ -92,10 +94,13 @@ private:
     vk::raii::DeviceMemory uvMemory = nullptr;
     vk::raii::Buffer exportBuffer = nullptr;
     vk::raii::DeviceMemory exportMemory = nullptr;
+    vk::raii::Buffer initialExportBuffer = nullptr;
+    vk::raii::DeviceMemory initialExportMemory = nullptr;
 
     glm::uvec3 dims{};
     float dt = 1.0f;
     uint32_t completedSteps = 0;
     std::vector<glm::vec4> labValues;
     std::vector<glm::vec3> rgbValues;
+    std::vector<glm::vec3> initialRgbValues;
 };

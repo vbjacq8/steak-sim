@@ -39,6 +39,7 @@ struct HeatSurface{
 //   A          show the whole grid again
 //   P          toggle the pan cells
 //   C          toggle cooked color, when the grid has a color volume
+//   I          voxel volume of the texture before cooking
 //   V          toggle voxel blocks and the mesh that samples them
 void showHeatGrid(const std::string& title, HeatGrid grid, const HeatParams& params, uint32_t steps, HeatSimulator simulate,
                   bool gridFollowsMesh = false, HeatSurface surface = {});

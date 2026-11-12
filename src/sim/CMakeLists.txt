@@ -68,7 +68,7 @@ add_custom_target(steak_voxelizer_shaders DEPENDS ${VOXELIZE_SPV} ${FINITE_DIFFE
 add_library(steak_voxelizer STATIC mesh_loader.cpp voxelizer.cpp compute_context.cpp heat_solver.cpp steak_pipeline.cpp color_solver.cpp)
 add_dependencies(steak_voxelizer steak_voxelizer_shaders)
 target_include_directories(steak_voxelizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(steak_voxelizer PUBLIC Vulkan::Vulkan steak_third_party)
+target_link_libraries(steak_voxelizer PUBLIC Vulkan::Vulkan steak_third_party PRIVATE tinygltf3)
 target_compile_definitions(steak_voxelizer PUBLIC
   VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1
   VULKAN_HPP_NO_STRUCT_CONSTRUCTORS=1

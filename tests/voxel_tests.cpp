@@ -662,14 +662,9 @@ std::vector<unsigned char> triangleBin(){
 const char* kTriangleJson =
     R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"rotation":[0,0,0.7071067811865476,0.7071067811865476],"children":[1]},{"mesh":0,"translation":[1,0,0]}],"meshes":[{"primitives":[{"attributes":{"POSITION":0,"TEXCOORD_0":1},"indices":2}]}],"accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"},{"bufferView":1,"componentType":5126,"count":3,"type":"VEC2"},{"bufferView":2,"componentType":5123,"count":3,"type":"SCALAR"}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":24},{"buffer":0,"byteOffset":60,"byteLength":6}],"buffers":[{"byteLength":68}]})";
 
-TEST(MeshLoader, FormatComesFromTheFilename){
-    EXPECT_EQ(meshFormatFromPath("steak.obj"), MeshFormat::Obj);
-    EXPECT_EQ(meshFormatFromPath("Steak.OBJ"), MeshFormat::Obj);
-    EXPECT_EQ(meshFormatFromPath("/models/cut.gltf"), MeshFormat::Gltf);
-    EXPECT_EQ(meshFormatFromPath("cut.GLB"), MeshFormat::Gltf);
-    EXPECT_EQ(meshFormatName(MeshFormat::Obj), "obj");
-    EXPECT_EQ(meshFormatName(MeshFormat::Gltf), "gltf");
-    EXPECT_THROW(meshFormatFromPath("steak.fbx"), std::runtime_error);
+TEST(MeshLoader, RejectsUnknownExtensionsAndMissingFiles){
+    EXPECT_THROW(loadMesh("steak.fbx"), std::runtime_error);
+    EXPECT_THROW(loadMesh((meshTestDir("missing") / "cut.glb").string()), std::runtime_error);
 }
 
 TEST(MeshLoader, Steak2KeepsBothBaseColorsAndDropsTheDuplicateShell){
@@ -697,7 +692,6 @@ TEST(MeshLoader, ObjKeepsFilePositions){
     EXPECT_EQ(mesh.indices.size() % 3, 0u);
     EXPECT_GT(mesh.indices.size(), 0u);
     EXPECT_EQ(mesh.texcoords.size(), mesh.positions.size());
-    EXPECT_THROW(loadMesh(STEAK_OBJ, MeshFormat::Gltf), std::runtime_error);
 }
 
 TEST(MeshLoader, GltfAppliesNodeTransformAndTexcoord){
@@ -709,9 +703,8 @@ TEST(MeshLoader, GltfAppliesNodeTransformAndTexcoord){
     json.insert(buffers + std::char_traits<char>::length("\"buffers\":[{"), "\"uri\":\"mesh.bin\",");
     writeBytes(dir / "cut.GLTF", json.data(), json.size());
 
-    const Mesh detected = loadMesh((dir / "cut.GLTF").string());
-    EXPECT_EQ(detected.format, MeshFormat::Gltf);
-    const Mesh mesh = loadMesh((dir / "cut.GLTF").string(), MeshFormat::Gltf);
+    const Mesh mesh = loadMesh((dir / "cut.GLTF").string());
+    EXPECT_EQ(mesh.format, MeshFormat::Gltf);
     ASSERT_EQ(mesh.positions.size(), 3u);
     ASSERT_EQ(mesh.indices.size(), 3u);
     EXPECT_EQ(mesh.indices[0], 0u);
@@ -728,7 +721,6 @@ TEST(MeshLoader, GltfAppliesNodeTransformAndTexcoord){
     EXPECT_EQ(mesh.texcoords.size(), 3u);
     EXPECT_FLOAT_EQ(mesh.texcoords[1].x, 1.0f);
     EXPECT_FLOAT_EQ(mesh.texcoords[1].y, 0.0f);
-    EXPECT_THROW(loadMesh((dir / "cut.GLTF").string(), MeshFormat::Obj), std::runtime_error);
 }
 
 TEST(MeshLoader, GlbReadsTheSameTriangle){
