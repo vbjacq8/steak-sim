@@ -286,4 +286,33 @@ TEST(ColorSolver, HeatIsUnchangedAndMeatGetsColor){
     }
 }
 
+// The live demo cooks in batches with a readback after each; heat, color and peaks must match one run.
+TEST(MeshHeatColorSession, BatchesMatchOneRun){
+    REQUIRE_VULKAN();
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> indices;
+    appendBox(positions, indices, {0.0f, 0.0f, 0.0f}, {2.0f, 1.0f, 2.0f});
+    const std::vector<glm::vec2> uvs(positions.size(), glm::vec2(0.25f, 0.25f));
+    const std::vector<uint8_t> image = texel(180, 40, 30);
+    const HeatParams params;
+
+    MeshHeatColorSession live(gpu()->ctx, positions, uvs, indices, 0.01f, params, image.data(), 2, 2);
+    const HeatGrid start = live.read();
+    const SteakHeatResult none = simulateMeshHeatColor(gpu()->ctx, positions, uvs, indices, 0.01f, params, 0, image.data(), 2, 2);
+    EXPECT_EQ(start.temperature, none.heat.temperature);
+    EXPECT_EQ(start.color, none.heat.color);
+
+    for (uint32_t batch : {3u, 1u, 11u}){
+        live.advance(batch);
+        live.read();
+    }
+    const HeatGrid grid = live.read();
+    const SteakHeatResult once = simulateMeshHeatColor(gpu()->ctx, positions, uvs, indices, 0.01f, params, 15, image.data(), 2, 2);
+    EXPECT_FLOAT_EQ(grid.time, once.heat.time);
+    EXPECT_EQ(grid.cells, once.heat.cells);
+    EXPECT_EQ(grid.temperature, once.heat.temperature);
+    EXPECT_EQ(grid.color, once.heat.color);
+    EXPECT_EQ(grid.peakCelsius, once.heat.peakCelsius);
+}
+
 }  // namespace

@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 
 namespace {
 
@@ -31,15 +32,30 @@ std::vector<char> readFile(const std::string& filename){
     return buffer;
 }
 
+std::vector<float> startingField(const HeatParams& params, const std::vector<uint32_t>& cells){
+    std::vector<float> initial(cells.size(), params.initialTemp);
+    for (size_t i = 0; i < cells.size(); ++i){
+        if (cells[i] == CELL_PAN) initial[i] = params.panTemp;
+        else if (cells[i] == CELL_AIR) initial[i] = params.airTemp;
+    }
+    return initial;
+}
+
 }  // namespace
 
-std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid){
-    const size_t slab = size_t(dims.x) * dims.y;
-    if (dims.z == 0 || solid.size() != slab * dims.z) throw std::invalid_argument("makePanCells: solid mask size != grid size");
+std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid, uint32_t panAxis){
+    const size_t count = size_t(dims.x) * dims.y * dims.z;
+    if (count == 0 || solid.size() != count) throw std::invalid_argument("makePanCells: solid mask size != grid size");
+    if (panAxis > 2) throw std::invalid_argument("makePanCells: pan axis must be 0, 1 or 2");
     std::vector<uint32_t> cells(solid.size());
-    for (size_t i = 0; i < cells.size(); ++i){
-        const bool panLayer = i < slab;  // z == 0
-        cells[i] = panLayer ? CELL_PAN : (solid[i] != 0 ? CELL_SOLID : CELL_AIR);
+    for (uint32_t z = 0; z < dims.z; ++z){
+        for (uint32_t y = 0; y < dims.y; ++y){
+            for (uint32_t x = 0; x < dims.x; ++x){
+                const size_t i = x + dims.x * (y + size_t(dims.y) * z);
+                const bool panLayer = glm::uvec3(x, y, z)[panAxis] == 0;
+                cells[i] = panLayer ? CELL_PAN : (solid[i] != 0 ? CELL_SOLID : CELL_AIR);
+            }
+        }
     }
     return cells;
 }
@@ -83,20 +99,44 @@ HeatGrid HeatSolver::run(const HeatParams& params, uint32_t steps, const std::fu
 
 HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, uint32_t steps,
                          const std::function<void(float)>& progress, HeatStepHook* hook){
-    std::vector<float> initial(cells.size(), params.initialTemp);
-    for (size_t i = 0; i < cells.size(); ++i){
-        if (cells[i] == CELL_PAN) initial[i] = params.panTemp;
-        else if (cells[i] == CELL_AIR) initial[i] = params.airTemp;
-    }
-    return run(params, cells, initial, steps, progress, hook);
+    return run(params, cells, startingField(params, cells), steps, progress, hook);
 }
 
 HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& cells, const std::vector<float>& initial,
                          uint32_t steps, const std::function<void(float)>& progress, HeatStepHook* hook){
-    HeatGrid grid{.dims = params.dims, .spacing = params.spacing, .time = steps * params.timeStep, .cells = cells};
-    if (grid.cellCount() == 0) throw std::invalid_argument("heat solver: empty grid");
-    if (initial.size() != grid.cellCount()) throw std::invalid_argument("heat solver: initial field size != grid size");
-    if (cells.size() != grid.cellCount()) throw std::invalid_argument("heat solver: cell kinds size != grid size");
+    HeatSession session(*this, params, cells, initial, hook);
+
+    // One submit keeps the steady-state path to a single queue wait. A progress callback submits in batches so the
+    // fraction can advance while the steps are actually running.
+    if (!progress || steps == 0){
+        vk::raii::CommandBuffer commandBuffer = session.beginCommands();
+        session.recordUploadOnce(commandBuffer);
+        session.recordSteps(commandBuffer, steps);
+        session.recordReadback(commandBuffer);
+        session.submit(commandBuffer);
+        return session.download();
+    }
+    const uint32_t batches = std::min(steps, 32u);
+    const uint32_t batchSteps = (steps + batches - 1u) / batches;
+    for (uint32_t begin = 0; begin < steps; begin += batchSteps){
+        const uint32_t end = std::min(steps, begin + batchSteps);
+        session.advance(end - begin);
+        progress(static_cast<float>(end) / static_cast<float>(steps));
+    }
+    return session.read();
+}
+
+HeatSession::HeatSession(const HeatSolver& solver, const HeatParams& params, const std::vector<uint32_t>& cells,
+                         HeatStepHook* hook)
+    : HeatSession(solver, params, cells, startingField(params, cells), hook){}
+
+HeatSession::HeatSession(const HeatSolver& solverIn, const HeatParams& paramsIn, const std::vector<uint32_t>& cellsIn,
+                         const std::vector<float>& initial, HeatStepHook* hookIn)
+    : solver(solverIn), params(paramsIn), cells(cellsIn), hook(hookIn){
+    const size_t count = size_t(params.dims.x) * params.dims.y * params.dims.z;
+    if (count == 0) throw std::invalid_argument("heat solver: empty grid");
+    if (initial.size() != count) throw std::invalid_argument("heat solver: initial field size != grid size");
+    if (cells.size() != count) throw std::invalid_argument("heat solver: cell kinds size != grid size");
     if (!(params.spacing > 0.0f) || !(params.timeStep > 0.0f) || !(params.diffusivity > 0.0f) ||
         !(params.conductivity > 0.0f) || !(params.panTransfer >= 0.0f) || !(params.airTransfer >= 0.0f)){
         throw std::invalid_argument("heat solver: spacing, time step, diffusivity and conductivity must be positive, "
@@ -109,38 +149,37 @@ HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& 
                                     std::to_string(maxStep) + " s for dx = " + std::to_string(params.spacing) + " m");
     }
 
-    // Staging holds the initial field then the cell kinds; the result is read back into the first half.
     static_assert(sizeof(float) == sizeof(uint32_t));
-    const vk::DeviceSize bytes = grid.cellCount() * sizeof(float);
-    auto [staging, stagingMemory] = createBuffer(2 * bytes,
+    bytes = count * sizeof(float);
+    std::tie(staging, stagingMemory) = solver.createBuffer(2 * bytes,
         vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     auto* mapped = static_cast<char*>(stagingMemory.mapMemory(0, 2 * bytes));
     std::memcpy(mapped, initial.data(), bytes);
     std::memcpy(mapped + bytes, cells.data(), bytes);
     stagingMemory.unmapMemory();
-    auto [cellBuffer, cellMemory] = createBuffer(bytes,
+    std::tie(cellBuffer, cellMemory) = solver.createBuffer(bytes,
         vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferDst,
         vk::MemoryPropertyFlagBits::eDeviceLocal);
 
-    // Ping-pong pair: step k reads fields[k % 2] and writes fields[(k + 1) % 2].
     const vk::BufferUsageFlags fieldUsage = vk::BufferUsageFlagBits::eStorageBuffer |
                                             vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
-    std::array<std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>, 2> fields{
-        createBuffer(bytes, fieldUsage, vk::MemoryPropertyFlagBits::eDeviceLocal),
-        createBuffer(bytes, fieldUsage, vk::MemoryPropertyFlagBits::eDeviceLocal)};
+    for (int k = 0; k < 2; ++k){
+        std::tie(fields[k], fieldMemory[k]) = solver.createBuffer(bytes, fieldUsage, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    }
 
     vk::DescriptorPoolSize poolSize{.type = vk::DescriptorType::eStorageBuffer, .descriptorCount = 6};
-    vk::raii::DescriptorPool descriptorPool(device, vk::DescriptorPoolCreateInfo{
+    descriptorPool = vk::raii::DescriptorPool(solver.device, vk::DescriptorPoolCreateInfo{
         .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
         .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize});
-    const std::array<vk::DescriptorSetLayout, 2> layouts{*setLayout, *setLayout};
-    vk::raii::DescriptorSets descriptorSets(device, vk::DescriptorSetAllocateInfo{
+    const std::array<vk::DescriptorSetLayout, 2> layouts{*solver.setLayout, *solver.setLayout};
+    vk::raii::DescriptorSets allocated(solver.device, vk::DescriptorSetAllocateInfo{
         .descriptorPool = descriptorPool, .descriptorSetCount = 2, .pSetLayouts = layouts.data()});
     for (uint32_t k = 0; k < 2; ++k){
+        descriptorSets[k] = std::move(allocated[k]);
         std::array<vk::DescriptorBufferInfo, 3> bufferInfos{{
-            {.buffer = fields[k].first, .offset = 0, .range = vk::WholeSize},
-            {.buffer = fields[1 - k].first, .offset = 0, .range = vk::WholeSize},
+            {.buffer = fields[k], .offset = 0, .range = vk::WholeSize},
+            {.buffer = fields[1 - k], .offset = 0, .range = vk::WholeSize},
             {.buffer = cellBuffer, .offset = 0, .range = vk::WholeSize},
         }};
         std::array<vk::WriteDescriptorSet, 3> writes{};
@@ -148,94 +187,96 @@ HeatGrid HeatSolver::run(const HeatParams& params, const std::vector<uint32_t>& 
             writes[b] = {.dstSet = descriptorSets[k], .dstBinding = b, .descriptorCount = 1,
                          .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &bufferInfos[b]};
         }
-        device.updateDescriptorSets(writes, {});
+        solver.device.updateDescriptorSets(writes, {});
     }
-    if (hook) hook->prepare(*fields[0].first, *fields[1].first);
+    if (hook) hook->prepare(*fields[0], *fields[1]);
+}
 
-    const HeatStepParams stepParams{.dims = params.dims, .fourier = params.fourier(), .panTemp = params.panTemp,
-                                    .panCoupling = params.panCoupling(), .airTemp = params.airTemp,
-                                    .airCoupling = params.airCoupling()};
-    const glm::uvec3 groups = (params.dims + GROUP_SIZE - 1u) / GROUP_SIZE;
-    const vk::BufferCopy wholeBuffer{.size = bytes};
-    vk::MemoryBarrier2 uploadToCompute{
+void HeatSession::advance(uint32_t steps){
+    vk::raii::CommandBuffer commandBuffer = beginCommands();
+    recordUploadOnce(commandBuffer);
+    recordSteps(commandBuffer, steps);
+    submit(commandBuffer);
+}
+
+HeatGrid HeatSession::read(){
+    vk::raii::CommandBuffer commandBuffer = beginCommands();
+    recordUploadOnce(commandBuffer);
+    recordReadback(commandBuffer);
+    submit(commandBuffer);
+    return download();
+}
+
+vk::raii::CommandBuffer HeatSession::beginCommands() const{
+    vk::raii::CommandBuffer commandBuffer = std::move(vk::raii::CommandBuffers(solver.device, vk::CommandBufferAllocateInfo{
+        .commandPool = solver.commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1}).front());
+    commandBuffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+    return commandBuffer;
+}
+
+void HeatSession::submit(vk::raii::CommandBuffer& commandBuffer) const{
+    commandBuffer.end();
+    solver.queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer}, nullptr);
+    solver.queue.waitIdle();
+}
+
+void HeatSession::recordUploadOnce(vk::raii::CommandBuffer& commandBuffer){
+    if (uploaded) return;
+    uploaded = true;
+    commandBuffer.copyBuffer(*staging, *fields[0], vk::BufferCopy{.size = bytes});
+    commandBuffer.copyBuffer(*staging, *cellBuffer, vk::BufferCopy{.srcOffset = bytes, .size = bytes});
+    const vk::MemoryBarrier2 uploadToCompute{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead};
-    vk::MemoryBarrier2 betweenSteps{
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadToCompute});
+    if (hook) hook->recordInit(commandBuffer);
+}
+
+void HeatSession::recordSteps(vk::raii::CommandBuffer& commandBuffer, uint32_t steps){
+    // A readback between batches copies out of buffers the next steps overwrite.
+    const vk::MemoryBarrier2 afterReadback{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite};
+    if (done > 0) commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &afterReadback});
+    const vk::MemoryBarrier2 betweenSteps{
         .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
         .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
         .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead | vk::AccessFlagBits2::eShaderStorageWrite |
                          vk::AccessFlagBits2::eTransferRead};
-    vk::MemoryBarrier2 toHost{
+    const HeatStepParams stepParams{.dims = params.dims, .fourier = params.fourier(), .panTemp = params.panTemp,
+                                    .panCoupling = params.panCoupling(), .airTemp = params.airTemp,
+                                    .airCoupling = params.airCoupling()};
+    const glm::uvec3 groups = (params.dims + GROUP_SIZE - 1u) / GROUP_SIZE;
+    for (uint32_t end = done + steps; done < end; ++done){
+        // Rebound every step: a color hook binds its own pipeline and overwrites push constants.
+        commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *solver.pipeline);
+        commandBuffer.pushConstants<HeatStepParams>(*solver.pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
+        commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *solver.pipelineLayout, 0, *descriptorSets[done % 2], nullptr);
+        commandBuffer.dispatch(groups.x, groups.y, groups.z);
+        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &betweenSteps});
+        if (hook) hook->recordAfterStep(commandBuffer, done);
+    }
+}
+
+void HeatSession::recordReadback(vk::raii::CommandBuffer& commandBuffer){
+    if (hook) hook->recordReadback(commandBuffer);
+    commandBuffer.copyBuffer(*fields[done % 2], *staging, vk::BufferCopy{.size = bytes});
+    const vk::MemoryBarrier2 toHost{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
         .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
         .dstStageMask = vk::PipelineStageFlagBits2::eHost,
         .dstAccessMask = vk::AccessFlagBits2::eHostRead};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
+}
 
-    auto beginCommands = [&](){
-        vk::raii::CommandBuffer commandBuffer = std::move(vk::raii::CommandBuffers(device, vk::CommandBufferAllocateInfo{
-            .commandPool = commandPool, .level = vk::CommandBufferLevel::ePrimary, .commandBufferCount = 1}).front());
-        commandBuffer.begin(vk::CommandBufferBeginInfo{.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-        return commandBuffer;
-    };
-    auto submit = [&](vk::raii::CommandBuffer& commandBuffer){
-        commandBuffer.end();
-        queue.submit(vk::SubmitInfo{.commandBufferCount = 1, .pCommandBuffers = &*commandBuffer}, nullptr);
-        queue.waitIdle();
-    };
-    auto recordUpload = [&](vk::raii::CommandBuffer& commandBuffer){
-        commandBuffer.copyBuffer(*staging, *fields[0].first, wholeBuffer);
-        commandBuffer.copyBuffer(*staging, *cellBuffer, vk::BufferCopy{.srcOffset = bytes, .size = bytes});
-        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &uploadToCompute});
-        if (hook) hook->recordInit(commandBuffer);
-    };
-    auto recordDispatches = [&](vk::raii::CommandBuffer& commandBuffer, uint32_t begin, uint32_t end){
-        for (uint32_t step = begin; step < end; ++step){
-            // Rebound every step: a color hook binds its own pipeline and overwrites push constants.
-            commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
-            commandBuffer.pushConstants<HeatStepParams>(*pipelineLayout, vk::ShaderStageFlagBits::eCompute, 0, stepParams);
-            commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipelineLayout, 0, *descriptorSets[step % 2], nullptr);
-            commandBuffer.dispatch(groups.x, groups.y, groups.z);
-            commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &betweenSteps});
-            if (hook) hook->recordAfterStep(commandBuffer, step);
-        }
-    };
-    auto recordReadback = [&](vk::raii::CommandBuffer& commandBuffer){
-        if (hook) hook->recordReadback(commandBuffer);
-        commandBuffer.copyBuffer(*fields[steps % 2].first, *staging, wholeBuffer);
-        commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
-    };
-
-    // One submit keeps the steady-state path to a single queue wait. A progress callback submits in batches so the
-    // fraction can advance while the steps are actually running.
-    if (!progress || steps == 0){
-        vk::raii::CommandBuffer commandBuffer = beginCommands();
-        recordUpload(commandBuffer);
-        recordDispatches(commandBuffer, 0, steps);
-        recordReadback(commandBuffer);
-        submit(commandBuffer);
-    } else{
-        {
-            vk::raii::CommandBuffer commandBuffer = beginCommands();
-            recordUpload(commandBuffer);
-            submit(commandBuffer);
-        }
-        const uint32_t batches = std::min(steps, 32u);
-        const uint32_t batchSteps = (steps + batches - 1u) / batches;
-        for (uint32_t begin = 0; begin < steps; begin += batchSteps){
-            const uint32_t end = std::min(steps, begin + batchSteps);
-            vk::raii::CommandBuffer commandBuffer = beginCommands();
-            recordDispatches(commandBuffer, begin, end);
-            submit(commandBuffer);
-            progress(static_cast<float>(end) / static_cast<float>(steps));
-        }
-        vk::raii::CommandBuffer commandBuffer = beginCommands();
-        recordReadback(commandBuffer);
-        submit(commandBuffer);
-    }
-
+HeatGrid HeatSession::download() const{
+    HeatGrid grid{.dims = params.dims, .spacing = params.spacing, .time = done * params.timeStep, .panAxis = params.panAxis,
+                  .cells = cells};
     grid.temperature.resize(grid.cellCount());
     std::memcpy(grid.temperature.data(), stagingMemory.mapMemory(0, bytes), bytes);
     stagingMemory.unmapMemory();

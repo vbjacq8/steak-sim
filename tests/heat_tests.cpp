@@ -102,6 +102,19 @@ TEST(HeatSolver, PanCellsFollowVoxelFlags){
     EXPECT_THROW(makePanCells(dims, std::vector<uint32_t>(5)), std::invalid_argument);
 }
 
+TEST(HeatSolver, PanCellsAlongY){
+    const glm::uvec3 dims(2, 3, 2);
+    const std::vector<uint32_t> cells = makePanCells(dims, std::vector<uint32_t>(12, 1u), 1);
+    for (uint32_t z = 0; z < dims.z; ++z){
+        for (uint32_t y = 0; y < dims.y; ++y){
+            for (uint32_t x = 0; x < dims.x; ++x){
+                EXPECT_EQ(cells[x + dims.x * (y + dims.y * z)], y == 0 ? CELL_PAN : CELL_SOLID);
+            }
+        }
+    }
+    EXPECT_THROW(makePanCells(dims, std::vector<uint32_t>(12, 1u), 3), std::invalid_argument);
+}
+
 TEST(HeatSolver, UniformFieldStaysUniform){
     REQUIRE_VULKAN();
     const HeatParams params{.dims = {16, 16, 16}, .initialTemp = 70.0f, .panTemp = 70.0f};
@@ -210,6 +223,25 @@ TEST(HeatSolver, ProgressBatchesMatchSingleSubmit){
     EXPECT_EQ(batched.temperature, once.temperature);
 }
 
+// A live view advances a session in uneven batches and reads it back in between; it must land on the same field.
+TEST(HeatSession, BatchesWithReadsMatchOneRun){
+    REQUIRE_VULKAN();
+    const HeatParams params{.dims = {9, 7, 6}, .panTemp = 400.0f};
+    const std::vector<uint32_t> cells = makeBlockCells(params.dims);
+    HeatSession session(gpu()->solver, params, cells);
+    EXPECT_EQ(session.read().temperature, gpu()->solver.run(params, cells, 0).temperature);
+    session.advance(7);
+    const HeatGrid partway = session.read();
+    EXPECT_FLOAT_EQ(partway.time, 7.0f);
+    EXPECT_EQ(partway.temperature, gpu()->solver.run(params, cells, 7).temperature);
+    session.advance(0);
+    session.advance(13);
+    const HeatGrid grid = session.read();
+    EXPECT_EQ(session.stepsDone(), 20u);
+    EXPECT_FLOAT_EQ(grid.time, 20.0f);
+    EXPECT_EQ(grid.temperature, gpu()->solver.run(params, cells, 20).temperature);
+}
+
 TEST(HeatSolver, RejectsUnstableTimeStep){
     REQUIRE_VULKAN();
     const HeatParams params{.dims = {8, 8, 8}, .spacing = 5.0e-4f, .timeStep = 1.0f};
@@ -273,6 +305,27 @@ TEST(SteakPipeline, VoxelizedBoxHeatsFromThePan){
     if (far > 1 && heat.kind(c.x, c.y, far) == CELL_SOLID){
         EXPECT_LE(heat.at(c.x, c.y, far), heat.at(c.x, c.y, 1));
     }
+}
+
+// The same kind of box standing on its side: with panAxis = 1 the y = 0 layer is the pan and heat comes in along y.
+TEST(SteakPipeline, PanAlongYHeatsTheLowYFace){
+    REQUIRE_VULKAN();
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> indices;
+    appendBox(positions, indices, {0.0f, 0.0f, 0.0f}, {2.0f, 1.0f, 2.0f});
+    HeatParams params;
+    params.panAxis = 1;
+    const SteakHeatResult result = simulateMeshHeat(gpu()->ctx, positions, indices, 0.01f, params, 60);
+    const HeatGrid& heat = result.heat;
+    EXPECT_EQ(heat.panAxis, 1u);
+    for (uint32_t z = 0; z < heat.dims.z; ++z){
+        for (uint32_t x = 0; x < heat.dims.x; ++x) ASSERT_EQ(heat.kind(x, 0, z), CELL_PAN);
+    }
+    const glm::uvec3 c = heat.dims / 2u;
+    ASSERT_EQ(heat.kind(c.x, 1, c.z), CELL_SOLID);
+    ASSERT_NE(heat.kind(c.x, c.y, 0), CELL_PAN);
+    EXPECT_GT(heat.at(c.x, 1, c.z), params.initialTemp + 10.0f);
+    EXPECT_GT(heat.at(c.x, 1, c.z), heat.at(c.x, heat.dims.y - 2, c.z));
 }
 
 }  // namespace

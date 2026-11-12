@@ -63,8 +63,18 @@ target_compile_definitions(steak_heat_view PRIVATE
 add_executable(heat_viewer heat_viewer.cpp)
 target_link_libraries(heat_viewer PRIVATE steak_heat_view)
 
+# Steak model loading and texture-atlas packing shared by steak_heat_demo and steak_heat_live.
+add_library(steak_demo_mesh STATIC demo_mesh.cpp)
+target_link_libraries(steak_demo_mesh PUBLIC steak_heat_view)
+
 add_executable(steak_heat_demo steak_heat_demo.cpp)
-target_link_libraries(steak_heat_demo PRIVATE steak_heat_view)
+target_link_libraries(steak_heat_demo PRIVATE steak_demo_mesh)
 target_compile_definitions(steak_heat_demo PRIVATE
+  STEAK_OBJ="${STEAK_OBJ}"
+  STEAK_TEXTURE="${STEAK_TEXTURE}")
+
+add_executable(steak_heat_live steak_heat_live.cpp)
+target_link_libraries(steak_heat_live PRIVATE steak_demo_mesh)
+target_compile_definitions(steak_heat_live PRIVATE
   STEAK_OBJ="${STEAK_OBJ}"
   STEAK_TEXTURE="${STEAK_TEXTURE}")

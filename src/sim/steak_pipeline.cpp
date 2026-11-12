@@ -1,8 +1,27 @@
 #include "steak_pipeline.hpp"
 
-#include "color_solver.hpp"
-
 #include <stdexcept>
+
+namespace {
+
+void copyColor(HeatGrid& heat, const ColorSolver& color, const VoxelGrid& voxels){
+    heat.color = color.linearRgb();
+    heat.initialColor = color.initialLinearRgb();
+    heat.peakCelsius = color.peakCelsius();
+    heat.colorReferenceY = color.reference().luminance;
+    heat.colorReferenceA = color.reference().redness;
+    heat.sampleUv = voxels.uv;
+}
+
+VoxelGrid voxelizeTextured(const ComputeContext& ctx, const std::vector<glm::vec3>& positions,
+                           const std::vector<glm::vec2>& texcoords, const std::vector<uint32_t>& indices,
+                           float metersPerUnit, float spacing){
+    if (!(metersPerUnit > 0.0f)) throw std::invalid_argument("metersPerUnit must be positive");
+    Voxelizer voxelizer(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, VOXELIZE_SPV);
+    return voxelizer.voxelize(positions, texcoords, indices, spacing / metersPerUnit);
+}
+
+}  // namespace
 
 SteakHeatResult simulateMeshHeat(const ComputeContext& ctx, const std::vector<glm::vec3>& positions,
                                  const std::vector<uint32_t>& indices, float metersPerUnit, HeatParams params,
@@ -17,7 +36,7 @@ SteakHeatResult simulateMeshHeat(const ComputeContext& ctx, const std::vector<gl
 
     params.dims = result.voxels.dims;
     HeatSolver solver(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, FINITE_DIFFERENCE_SPV);
-    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells);
+    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells, params.panAxis);
     if (progress){
         result.heat = solver.run(params, cells, steps, [&](float fraction){ progress(0.2f + 0.8f * fraction); });
     } else{
@@ -35,12 +54,11 @@ SteakHeatResult simulateMeshHeatColor(const ComputeContext& ctx, const std::vect
 
     if (progress) progress(0.02f);
     SteakHeatResult result;
-    Voxelizer voxelizer(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, VOXELIZE_SPV);
-    result.voxels = voxelizer.voxelize(positions, texcoords, indices, params.spacing / metersPerUnit);
+    result.voxels = voxelizeTextured(ctx, positions, texcoords, indices, metersPerUnit, params.spacing);
     if (progress) progress(0.2f);
 
     params.dims = result.voxels.dims;
-    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells);
+    const std::vector<uint32_t> cells = makePanCells(params.dims, result.voxels.cells, params.panAxis);
     ColorSolver color(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, COLOR_INIT_SPV, COLOR_KINETICS_SPV,
                       COLOR_EXPORT_SPV);
     color.prepareGrid(result.voxels.dims, cells, result.voxels.uv, rgba, textureWidth, textureHeight, params.timeStep);
@@ -52,11 +70,26 @@ SteakHeatResult simulateMeshHeatColor(const ComputeContext& ctx, const std::vect
         result.heat = solver.run(params, cells, steps, {}, &color);
     }
     color.download();
-    result.heat.color = color.linearRgb();
-    result.heat.initialColor = color.initialLinearRgb();
-    result.heat.peakCelsius = color.peakCelsius();
-    result.heat.colorReferenceY = color.reference().luminance;
-    result.heat.colorReferenceA = color.reference().redness;
-    result.heat.sampleUv = result.voxels.uv;
+    copyColor(result.heat, color, result.voxels);
     return result;
+}
+
+MeshHeatColorSession::MeshHeatColorSession(const ComputeContext& ctx, const std::vector<glm::vec3>& positions,
+                                           const std::vector<glm::vec2>& texcoords, const std::vector<uint32_t>& indices,
+                                           float metersPerUnit, HeatParams params, const uint8_t* rgba,
+                                           uint32_t textureWidth, uint32_t textureHeight)
+    : voxelGrid(voxelizeTextured(ctx, positions, texcoords, indices, metersPerUnit, params.spacing)),
+      color(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, COLOR_INIT_SPV, COLOR_KINETICS_SPV, COLOR_EXPORT_SPV),
+      solver(ctx.device, ctx.physicalDevice, ctx.queue, ctx.queueFamily, FINITE_DIFFERENCE_SPV){
+    params.dims = voxelGrid.dims;
+    const std::vector<uint32_t> cells = makePanCells(params.dims, voxelGrid.cells, params.panAxis);
+    color.prepareGrid(voxelGrid.dims, cells, voxelGrid.uv, rgba, textureWidth, textureHeight, params.timeStep);
+    session.emplace(solver, params, cells, &color);
+}
+
+HeatGrid MeshHeatColorSession::read(){
+    HeatGrid heat = session->read();
+    color.download();
+    copyColor(heat, color, voxelGrid);
+    return heat;
 }

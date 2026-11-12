@@ -1,9 +1,10 @@
-// Heat-map window shared by heat_viewer and steak_heat_demo. Only the faces between a drawn cell and
-// an undrawn one (air, hidden pan, outside the slice, or outside the grid) are built, so a 128^3 grid
-// stays at ~100k quads.
+// Heat-map window shared by heat_viewer, steak_heat_demo and steak_heat_live. Only the faces between a
+// drawn cell and an undrawn one (air, hidden pan, outside the slice, or outside the grid) are built, so a
+// 128^3 grid stays at ~100k quads.
 //
-// The side panel keeps a temperature key, then a reset button, then collapsible settings. Typing in a
-// box stores that value; the blocks change when a reset finishes.
+// The side panel keeps a temperature key, then a reset button (a clock with Start, Pause and Reset in
+// live mode), then collapsible settings. Typing in a box stores that value; the blocks change when a
+// reset finishes, or in live mode on the next Start or Reset.
 
 #include "heat_view.hpp"
 
@@ -18,7 +19,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -26,7 +29,11 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace gui = open3d::visualization::gui;
@@ -42,11 +49,32 @@ constexpr float COLOR_MAX_F = 200.0f;
 constexpr int MAX_DIM = 256;
 constexpr long MAX_STEPS = 100000;
 constexpr std::array<const char*, 3> AXIS_NAMES{"X", "Y", "Z"};
+// Simulated seconds per real second.
+constexpr std::array<double, 9> LIVE_SPEEDS{1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0};
+constexpr std::array<const char*, 9> LIVE_SPEED_NAMES{"1x (real time)", "2x", "5x", "10x", "20x", "30x", "60x", "120x", "300x"};
+constexpr uint32_t MAX_LIVE_BATCH = 5000;  // steps per redraw; beyond this the clock falls behind instead
+constexpr std::chrono::milliseconds LIVE_FRAME_INTERVAL{33};
 
 std::string format(const char* fmt, double value){
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), fmt, value);
     return buffer;
+}
+
+// m:ss, or h:mm:ss from an hour on.
+std::string formatClock(double seconds){
+    const long total = std::max(0L, static_cast<long>(std::floor(seconds + 1e-6)));
+    char buffer[32];
+    if (total >= 3600){
+        std::snprintf(buffer, sizeof(buffer), "%ld:%02ld:%02ld", total / 3600, total / 60 % 60, total % 60);
+    } else{
+        std::snprintf(buffer, sizeof(buffer), "%ld:%02ld", total / 60, total % 60);
+    }
+    return buffer;
+}
+
+uint32_t liveStepCount(const HeatParams& params){
+    return static_cast<uint32_t>(std::max(1L, std::lround(params.duration / params.timeStep)));
 }
 
 bool parseNumber(const char* text, double& value, std::string& error){
@@ -199,7 +227,8 @@ bool hasSurface(const HeatSurface& surface){
 struct GridFrame{
     glm::vec3 origin{};
     float voxelSize = 1.0f;
-    float midZ = 0.0f;  // model-space height halfway up the mesh; splits the pan side from the top
+    uint32_t panAxis = 2;
+    float mid = 0.0f;  // model-space coordinate halfway across the mesh along panAxis; splits the pan side from the other
 };
 
 // Same corner the voxelizer uses, so a model-space point lands in the cell the blocks draw for that index.
@@ -211,7 +240,8 @@ GridFrame gridFrame(const HeatGrid& grid, const HeatSurface& surface){
         high = glm::max(high, point);
     }
     const VoxelGrid layout = makeVoxelGridLayout(low, high, grid.spacing / surface.metersPerUnit);
-    return {layout.origin, layout.voxelSize, 0.5f * (low.z + high.z)};
+    const uint32_t axis = std::min(grid.panAxis, 2u);
+    return {layout.origin, layout.voxelSize, axis, 0.5f * (low[axis] + high[axis])};
 }
 
 Eigen::Vector3d sampleVoxel(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position, float coldTemp, float hotTemp,
@@ -276,10 +306,10 @@ bool hasAlbedo(const HeatSurface& surface){
 
 // Meshes often map their top and bottom faces onto the same texels, so one texture could not cook the
 // pan side differently from the top. The drawn albedo holds two copies side by side: the left page for
-// triangles above GridFrame::midZ, the right page for those below it.
+// triangles on the far side of GridFrame::mid, the right page for those on the pan side.
 constexpr int kAlbedoPages = 2;
 
-bool belowMid(const GridFrame& frame, float z){ return z < frame.midZ; }
+bool panSide(const GridFrame& frame, glm::vec3 centroid){ return centroid[frame.panAxis] < frame.mid; }
 
 std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
     if (!hasAlbedo(surface)) return nullptr;
@@ -359,7 +389,7 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
         const uint32_t ids[3] = {surface.indices[t], surface.indices[t + 1], surface.indices[t + 2]};
         if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
         const glm::vec3 p[3] = {surface.positions[ids[0]], surface.positions[ids[1]], surface.positions[ids[2]]};
-        const int page = belowMid(frame, (p[0].z + p[1].z + p[2].z) / 3.0f) ? 1 : 0;
+        const int page = panSide(frame, (p[0] + p[1] + p[2]) / 3.0f) ? 1 : 0;
         // Display UVs are V up; image rows run top first.
         glm::vec2 q[3];
         for (int c = 0; c < 3; ++c){
@@ -423,6 +453,21 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
     return image;
 }
 
+// Open3D 0.20 keys textures by a hash of their pixels and never forgets a key. Removing a geometry leaves its
+// texture alive, so re-adding the mesh with a new cooked texture every live frame leaked a full atlas each time.
+// And once a texture is freed, adding the same pixels again hands back the dead handle, which Filament aborts on.
+// So every surface upload gets pixels no earlier upload had, and the window frees that texture with its geometry.
+std::shared_ptr<open3d::geometry::Image> uniqueTexture(const open3d::geometry::Image& image){
+    static uint64_t serial = 0;
+    ++serial;
+    auto copy = std::make_shared<open3d::geometry::Image>(image);
+    // The serial goes in the low bit of the first 64 bytes: at most 1/255 off in a few texels of the top row.
+    for (size_t bit = 0; bit < 64 && bit < copy->data_.size(); ++bit){
+        copy->data_[bit] = static_cast<uint8_t>((copy->data_[bit] & 0xFEu) | ((serial >> bit) & 1u));
+    }
+    return copy;
+}
+
 // Textured mesh, the same surface steak_color_demo draws. Cooked color is a full-resolution
 // texture; vertex colors are only the fallback when the mesh has no albedo.
 open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const HeatSurface& surface, int sliceAxis, int slice,
@@ -446,9 +491,8 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
         if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
         if (!inSlice(surface.positions[ids[0]]) && !inSlice(surface.positions[ids[1]]) && !inSlice(surface.positions[ids[2]])) continue;
         Eigen::Vector3i triangle;
-        const float centroidZ =
-            (surface.positions[ids[0]].z + surface.positions[ids[1]].z + surface.positions[ids[2]].z) / 3.0f;
-        const float page = belowMid(frame, centroidZ) ? 1.0f : 0.0f;
+        const glm::vec3 centroid = (surface.positions[ids[0]] + surface.positions[ids[1]] + surface.positions[ids[2]]) / 3.0f;
+        const float page = panSide(frame, centroid) ? 1.0f : 0.0f;
         for (int corner = 0; corner < 3; ++corner){
             int& slot = remap[ids[corner]];
             if (slot < 0){
@@ -472,8 +516,10 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
 
 class HeatViewWindow : public gui::Window{
 public:
+    // With `liveIn` set, the window plays that simulation on a clock instead of resetting through `simulateIn`.
     HeatViewWindow(const std::string& title, HeatGrid gridIn, HeatParams paramsIn, uint32_t stepsIn, HeatSimulator simulateIn,
-                   bool gridFollowsMeshIn, HeatSurface surfaceIn, gui::FontId headingFontIn)
+                   bool gridFollowsMeshIn, HeatSurface surfaceIn, gui::FontId headingFontIn,
+                   std::unique_ptr<LiveHeat> liveIn = nullptr, gui::FontId clockFontIn = gui::Application::DEFAULT_FONT_ID)
         : gui::Window(title, 1400, 850),
           grid(std::move(gridIn)),
           edited(paramsIn),
@@ -481,7 +527,10 @@ public:
           surface(std::move(surfaceIn)),
           editedSteps(stepsIn),
           gridFollowsMesh(gridFollowsMeshIn),
-          headingFont(headingFontIn){
+          headingFont(headingFontIn),
+          live(std::move(liveIn)),
+          clockFont(clockFontIn),
+          liveParams(paramsIn){
         coldTemp = COLOR_MIN_F;
         hotTemp = COLOR_MAX_F;
         recount();
@@ -498,7 +547,7 @@ public:
         albedoImage = makeAlbedo(surface);
         textureMaterial.albedo_img = albedoImage;
         textureMaterial.sRGB_color = true;
-        rebuildView();
+        rebuildNow();
 
         const auto& bounds = scene->GetScene()->GetBoundingBox();
         scene->SetupCamera(60.0f, bounds, bounds.GetCenter().cast<float>());
@@ -508,6 +557,20 @@ public:
         SetOnKeyEvent([this](const gui::KeyEvent& e){ return onKey(e); });
         SetOnClose([this](){ return !resetting; });
         SetOnTickEvent([this](){ return onTick(); });
+        if (live){
+            liveView = currentView();
+            liveWorker = std::thread([this, start = liveParams](){ liveLoop(start); });
+        }
+    }
+
+    ~HeatViewWindow() override{
+        if (!liveWorker.joinable()) return;
+        {
+            std::lock_guard<std::mutex> lock(liveMutex);
+            liveQuit = true;
+        }
+        liveWake.notify_all();
+        liveWorker.join();
     }
 
     void Layout(const gui::LayoutContext& context) override{
@@ -531,13 +594,15 @@ private:
         panContactCells = 0;
         minTemp = std::numeric_limits<float>::max();
         maxTemp = std::numeric_limits<float>::lowest();
+        const uint32_t axis = std::min(grid.panAxis, 2u);
+        const size_t stride = axis == 0 ? 1 : axis == 1 ? size_t(grid.dims.x) : size_t(grid.dims.x) * grid.dims.y;
         for (size_t i = 0; i < grid.cellCount(); ++i){
             if (grid.cells[i] != CELL_SOLID) continue;
             ++solidCells;
             minTemp = std::min(minTemp, grid.temperature[i]);
             maxTemp = std::max(maxTemp, grid.temperature[i]);
-            const size_t slab = size_t(grid.dims.x) * grid.dims.y;
-            if (i >= slab && grid.cells[i - slab] == CELL_PAN) ++panContactCells;
+            const size_t along = i / stride % grid.dims[axis];
+            if (along > 0 && grid.cells[i - stride] == CELL_PAN) ++panContactCells;
         }
     }
 
@@ -547,23 +612,51 @@ private:
         cookedReady = true;
     }
 
+    void removeSurface(){
+        auto& scene3d = *scene->GetScene();
+        if (scene3d.HasGeometry("surface")) scene3d.RemoveGeometry("surface");
+        if (!holdsSurfaceTexture) return;
+        // One release for the reference taken in uploadView, one for the extra count Open3D starts a texture with.
+        GetRenderer().RemoveTexture(surfaceTexture);
+        GetRenderer().RemoveTexture(surfaceTexture);
+        holdsSurfaceTexture = false;
+    }
+
     void uploadView(){
         auto& scene3d = *scene->GetScene();
         if (scene3d.HasGeometry("blocks")) scene3d.RemoveGeometry("blocks");
-        if (scene3d.HasGeometry("surface")) scene3d.RemoveGeometry("surface");
+        removeSurface();
         if (showVolume || !hasSurface(surface)){
             if (!blocks.triangles_.empty()) scene3d.AddGeometry("blocks", &blocks, material, false);
         } else if (!surfaceDraw.triangles_.empty()){
             if (showCookedColor && hasAlbedo(surface)) ensureCookedAlbedo();
-            const bool photo = textureMaterial.albedo_img != nullptr;
-            if (photo) textureMaterial.albedo_img = (showCookedColor && cookedAlbedo) ? cookedAlbedo : albedoImage;
-            scene3d.AddGeometry("surface", &surfaceDraw, photo ? textureMaterial : material, false);
+            if (albedoImage){
+                auto texture = uniqueTexture((showCookedColor && cookedAlbedo) ? *cookedAlbedo : *albedoImage);
+                textureMaterial.albedo_img = texture;
+                scene3d.AddGeometry("surface", &surfaceDraw, textureMaterial, false);
+                surfaceTexture = GetRenderer().AddTexture(texture, true);
+                holdsSurfaceTexture = true;
+            } else{
+                scene3d.AddGeometry("surface", &surfaceDraw, material, false);
+            }
         }
         PostRedraw();
     }
 
+    // Widget callbacks run in the middle of Open3D's draw, and swapping scene geometry and textures there is
+    // not safe. So the setters only ask for a rebuild, and it runs from the event loop before the next draw.
     void rebuildView(){
+        if (rebuildPosted) return;
+        rebuildPosted = true;
+        gui::Application::GetInstance().PostToMainThread(this, [this](){
+            if (rebuildPosted) rebuildNow();
+        });
+    }
+
+    void rebuildNow(){
+        rebuildPosted = false;
         if (resetting) return;
+        publishView();
         if (showVolume || !hasSurface(surface)){
             blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, showInitialColor, {});
         } else{
@@ -600,6 +693,8 @@ private:
             const std::string prefix = row == 0 ? ">= " : row == LEGEND_ROWS - 1 ? "<= " : "";
             legendLabels[row]->SetText((prefix + format("%.0f", coldTemp + t * (hotTemp - coldTemp))).c_str());
         }
+        // Labels keep the width they were laid out with; a value that gains a digit would spill out of it.
+        SetNeedsLayout();
     }
 
     void setColorMax(float value){
@@ -656,7 +751,15 @@ private:
     void onFieldChanged(size_t index, const char* text){
         std::string error;
         if (!fields[index].commit(text, error)) ShowMessageBox("Invalid value", error.c_str());
+        else liveSettingsChanged = true;
         refreshFields();
+    }
+
+    // Read-only values only, so a box the user is typing in keeps its text while the clock runs.
+    void refreshReadouts(){
+        for (SettingField& field : fields){
+            if (field.value) field.value->SetText(field.current().c_str());
+        }
     }
 
     // Writes `edited` only after the whole value is valid, so a rejected edit leaves the saved model alone.
@@ -760,16 +863,21 @@ private:
         panel->AddChild(rangeRow);
         panel->AddFixed(em / 2);
 
-        auto resetButton = std::make_shared<gui::Button>("Reset simulation");
-        resetButton->SetOnClicked([this](){ askReset(); });
-        panel->AddChild(resetButton);
+        if (live){
+            buildClock(*panel, em);
+        } else{
+            auto resetButton = std::make_shared<gui::Button>("Reset simulation");
+            resetButton->SetOnClicked([this](){ askReset(); });
+            panel->AddChild(resetButton);
+        }
         panel->AddFixed(em / 2);
 
         auto settings = std::make_shared<gui::Label>("Settings");
         settings->SetFontId(headingFont);
         settings->SetTextColor(gui::Color(1.0f, 1.0f, 1.0f));
         panel->AddChild(settings);
-        auto hint = std::make_shared<gui::Label>("Type a value, then reset to run the simulation.");
+        auto hint = std::make_shared<gui::Label>(live ? "Type a value; Start or Reset uses it." :
+                                                        "Type a value, then reset to run the simulation.");
         hint->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
         panel->AddChild(hint);
 
@@ -947,6 +1055,7 @@ private:
             helpText += "\n Press 'I' for the voxel volume of the texture before cooking.";
         }
         if (hasSurface(surface)) helpText += "\n Press 'V' to toggle the voxel volume and the mesh.";
+        if (live) helpText += "\n Press Space to start or pause, '[' and ']' to change the speed.";
         auto help = std::make_shared<gui::Label>(helpText.c_str());
         help->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
         scroll->AddChild(help);
@@ -1069,6 +1178,360 @@ private:
         return true;
     }
 
+    // ---- Live clock ----------------------------------------------------------------------------------------
+    //
+    // A worker thread owns `live`. While playing it steps the run to keep up with the clock, builds the
+    // view's geometry off the UI thread, and posts one frame at a time; it waits for that frame to be shown
+    // before stepping again. Every Start-from-scratch or Reset bumps liveGeneration, and frames from an
+    // older generation are dropped.
+
+    enum class LiveState{ Ready, Preparing, Playing, Paused, Finished };
+
+    struct ViewState{
+        int sliceAxis = 2;
+        int slice = -1;
+        bool pan = true;
+        bool cooked = false;
+        bool initial = false;
+        bool volume = true;
+        float cold = 0.0f;
+        float hot = 0.0f;
+        bool operator==(const ViewState&) const = default;
+    };
+
+    struct LiveFrame{
+        HeatGrid grid;
+        ViewState view;
+        open3d::geometry::TriangleMesh geometry;  // blocks or surface, whichever view.volume selects
+        std::shared_ptr<open3d::geometry::Image> cookedAlbedo;
+        uint64_t generation = 0;
+        bool finished = false;
+    };
+
+    struct LiveRequest{
+        HeatParams params;
+        bool play = false;
+        uint64_t generation = 0;
+    };
+
+    ViewState currentView() const{
+        return {sliceAxis, slice, showPan, showCookedColor, showInitialColor, showVolume, coldTemp, hotTemp};
+    }
+
+    void publishView(){
+        if (!live) return;
+        std::lock_guard<std::mutex> lock(liveMutex);
+        liveView = currentView();
+    }
+
+    void buildClock(gui::Vert& parent, int em){
+        auto title = std::make_shared<gui::Label>("Clock");
+        title->SetFontId(headingFont);
+        title->SetTextColor(gui::Color(1.0f, 1.0f, 1.0f));
+        parent.AddChild(title);
+        clockLabel = std::make_shared<gui::Label>("");
+        clockLabel->SetFontId(clockFont);
+        clockLabel->SetTextColor(gui::Color(1.0f, 1.0f, 1.0f));
+        parent.AddChild(clockLabel);
+
+        auto buttons = std::make_shared<gui::Horiz>(em / 2);
+        playButton = std::make_shared<gui::Button>("Start");
+        playButton->SetOnClicked([this](){ startOrPause(); });
+        liveResetButton = std::make_shared<gui::Button>("Reset");
+        liveResetButton->SetOnClicked([this](){ requestRestart(false); });
+        buttons->AddChild(playButton);
+        buttons->AddChild(liveResetButton);
+        parent.AddChild(buttons);
+
+        auto speedLabel = std::make_shared<gui::Label>("Speed");
+        speedCombo = std::make_shared<gui::Combobox>(std::vector<const char*>(LIVE_SPEED_NAMES.begin(), LIVE_SPEED_NAMES.end()));
+        speedCombo->SetSelectedIndex(speedIndex);
+        speedCombo->SetOnValueChanged([this](const char*, int index){ setSpeed(index); });
+        parent.AddChild(std::make_shared<steakui::SliceAxisRow>(speedLabel, speedCombo));
+
+        liveStatus = std::make_shared<gui::Label>("");
+        liveStatus->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
+        parent.AddChild(liveStatus);
+        syncClock();
+    }
+
+    void syncClock(){
+        if (!clockLabel) return;
+        const double end = liveStepCount(liveParams) * static_cast<double>(liveParams.timeStep);
+        const std::string clock = formatClock(grid.time) + " / " + formatClock(end);
+        const char* button = "Start";
+        std::string status;
+        switch (liveState){
+            case LiveState::Ready: status = "Ready. Adjust the settings, then press Start."; break;
+            case LiveState::Preparing: status = "Preparing the simulation..."; break;
+            case LiveState::Playing:
+                button = "Pause";
+                status = std::string("Cooking at ") + LIVE_SPEED_NAMES[static_cast<size_t>(speedIndex)] + ".";
+                break;
+            case LiveState::Paused:
+                button = "Resume";
+                status = "Paused.";
+                break;
+            case LiveState::Finished:
+                button = "Start over";
+                status = "Done. Start cooks again from the beginning.";
+                break;
+        }
+        // A label keeps the width it was laid out with, so lay out again when any text grows or shrinks.
+        if (clock.size() != shownClock.size() || status != shownStatus || button != shownButton) SetNeedsLayout();
+        clockLabel->SetText(clock.c_str());
+        liveStatus->SetText(status.c_str());
+        playButton->SetText(button);
+        playButton->SetEnabled(liveState != LiveState::Preparing);
+        liveResetButton->SetEnabled(liveState != LiveState::Preparing);
+        shownClock = clock;
+        shownStatus = status;
+        shownButton = button;
+    }
+
+    void setSpeed(int index){
+        speedIndex = std::clamp(index, 0, static_cast<int>(LIVE_SPEEDS.size()) - 1);
+        if (speedCombo) speedCombo->SetSelectedIndex(speedIndex);
+        {
+            std::lock_guard<std::mutex> lock(liveMutex);
+            liveSpeed = LIVE_SPEEDS[static_cast<size_t>(speedIndex)];
+        }
+        liveWake.notify_all();
+        syncClock();
+    }
+
+    void setPlaying(bool play){
+        {
+            std::lock_guard<std::mutex> lock(liveMutex);
+            livePlaying = play;
+            if (play) liveResumed = true;
+        }
+        liveWake.notify_all();
+    }
+
+    void startOrPause(){
+        switch (liveState){
+            case LiveState::Preparing: return;
+            case LiveState::Playing:
+                setPlaying(false);
+                liveState = LiveState::Paused;
+                break;
+            case LiveState::Paused:
+                setPlaying(true);
+                liveState = LiveState::Playing;
+                break;
+            case LiveState::Ready:
+                // Already at time zero with these settings; just let the clock run.
+                if (!liveSettingsChanged){
+                    setPlaying(true);
+                    liveState = LiveState::Playing;
+                    break;
+                }
+                requestRestart(true);
+                return;
+            case LiveState::Finished: requestRestart(true); return;
+        }
+        syncClock();
+    }
+
+    void requestRestart(bool play){
+        if (liveState == LiveState::Preparing) return;
+        const std::string error = resetError();
+        if (!error.empty()){
+            ShowMessageBox(play ? "Cannot start" : "Cannot reset", error.c_str());
+            return;
+        }
+        liveSettingsChanged = false;
+        {
+            std::lock_guard<std::mutex> lock(liveMutex);
+            ++liveGeneration;
+            livePlaying = false;
+            liveRequest = LiveRequest{edited, play, liveGeneration};
+            liveView = currentView();
+        }
+        liveWake.notify_all();
+        liveState = LiveState::Preparing;
+        syncClock();
+    }
+
+    // Worker thread. Touches the window only through liveMutex state and PostToMainThread.
+    void liveLoop(HeatParams params){
+        using Clock = std::chrono::steady_clock;
+        uint32_t done = 0;
+        double owed = 0.0;  // simulated seconds the clock is ahead of the field
+        Clock::time_point last = Clock::now();
+        bool broken = false;  // the last restart or advance threw; only a restart recovers
+        std::unique_lock<std::mutex> lock(liveMutex);
+        while (true){
+            liveWake.wait(lock, [this](){ return liveQuit || liveRequest.has_value() || (livePlaying && framesInFlight == 0); });
+            if (liveQuit) return;
+
+            if (liveRequest){
+                const LiveRequest request = *liveRequest;
+                liveRequest.reset();
+                const ViewState view = liveView;
+                lock.unlock();
+                auto frame = std::make_shared<LiveFrame>();
+                std::string error;
+                try{
+                    frame->grid = live->restart(request.params);
+                    buildFrame(*frame, view);
+                } catch (const std::exception& e){
+                    error = e.what();
+                }
+                lock.lock();
+                params = request.params;
+                done = 0;
+                owed = 0.0;
+                broken = !error.empty();
+                if (liveRequest) continue;  // superseded while it ran
+                frame->generation = request.generation;
+                livePlaying = !broken && request.play;
+                liveResumed = livePlaying;
+                ++framesInFlight;
+                gui::Application::GetInstance().PostToMainThread(this, [this, frame, request, error](){
+                    onLiveRestarted(frame, request, error);
+                });
+                continue;
+            }
+
+            const uint32_t endStep = liveStepCount(params);
+            if (broken || done >= endStep){
+                livePlaying = false;
+                continue;
+            }
+            const Clock::time_point now = Clock::now();
+            if (liveResumed){
+                liveResumed = false;
+                last = now;
+            }
+            owed += std::chrono::duration<double>(now - last).count() * liveSpeed;
+            last = now;
+            const double due = std::floor(owed / params.timeStep);
+            const auto steps = static_cast<uint32_t>(std::min({due, static_cast<double>(endStep - done), static_cast<double>(MAX_LIVE_BATCH)}));
+            if (steps == 0){
+                const double wait = (params.timeStep - owed) / liveSpeed;
+                liveWake.wait_for(lock, std::chrono::duration<double>(std::clamp(wait, 0.001, 0.1)));
+                continue;
+            }
+            owed = std::min(owed - steps * static_cast<double>(params.timeStep), MAX_LIVE_BATCH * static_cast<double>(params.timeStep));
+            const ViewState view = liveView;
+            const uint64_t generation = liveGeneration;
+            lock.unlock();
+            auto frame = std::make_shared<LiveFrame>();
+            std::string error;
+            try{
+                frame->grid = live->advance(steps);
+                buildFrame(*frame, view);
+            } catch (const std::exception& e){
+                error = e.what();
+            }
+            lock.lock();
+            if (liveRequest) continue;
+            frame->generation = generation;
+            if (!error.empty()){
+                broken = true;
+                livePlaying = false;
+                ++framesInFlight;
+                gui::Application::GetInstance().PostToMainThread(this, [this, generation, error](){ onLiveFailed(generation, error); });
+                continue;
+            }
+            done += steps;
+            frame->finished = done >= endStep;
+            if (frame->finished) livePlaying = false;
+            ++framesInFlight;
+            gui::Application::GetInstance().PostToMainThread(this, [this, frame](){ onLiveFrame(frame); });
+            liveWake.wait_until(lock, now + LIVE_FRAME_INTERVAL, [this](){ return liveQuit || liveRequest.has_value(); });
+        }
+    }
+
+    // Worker thread. `surface` is never written after construction, so it is safe to read here.
+    void buildFrame(LiveFrame& frame, const ViewState& view) const{
+        frame.view = view;
+        if (view.volume || !hasSurface(surface)){
+            frame.geometry = buildHeatMesh(frame.grid, view.sliceAxis, view.slice, view.pan, view.cold, view.hot, view.cooked,
+                                           view.initial, {});
+            return;
+        }
+        frame.geometry = buildSurfaceMesh(frame.grid, surface, view.sliceAxis, view.slice, view.cold, view.hot, view.cooked);
+        if (view.cooked && hasAlbedo(surface)) frame.cookedAlbedo = bakeCookedAlbedo(frame.grid, surface);
+    }
+
+    void frameShown(){
+        {
+            std::lock_guard<std::mutex> lock(liveMutex);
+            --framesInFlight;
+        }
+        liveWake.notify_all();
+    }
+
+    void showLiveFrame(LiveFrame& frame){
+        const bool shapeChanged = frame.grid.dims != grid.dims || frame.grid.spacing != grid.spacing;
+        grid = std::move(frame.grid);
+        recount();
+        if (shapeChanged){
+            slice = slice < 0 ? -1 : std::min(slice, std::max(0, static_cast<int>(grid.dims[sliceAxis]) - 1));
+            sliceSlider->SetLimits(0, std::max(1u, grid.dims[sliceAxis]) - 1u);
+            syncSliceControls();
+        }
+        cookedAlbedo = frame.cookedAlbedo;
+        cookedReady = cookedAlbedo != nullptr;
+        if (frame.view == currentView()){
+            const bool drawsSurface = !frame.view.volume && hasSurface(surface);
+            // The photo texture without cooking does not change as the field does, so neither does that surface.
+            const bool unchanged =
+                drawsSurface && albedoImage && !frame.view.cooked && !shapeChanged && holdsSurfaceTexture && !rebuildPosted;
+            if (!drawsSurface) blocks = std::move(frame.geometry);
+            else surfaceDraw = std::move(frame.geometry);
+            if (!unchanged) uploadView();
+            rebuildPosted = false;  // this frame was built for the view a pending rebuild was asked for
+        } else{
+            rebuildNow();
+        }
+        if (shapeChanged){
+            const auto& bounds = scene->GetScene()->GetBoundingBox();
+            scene->SetupCamera(60.0f, bounds, bounds.GetCenter().cast<float>());
+        }
+        refreshReadouts();
+    }
+
+    void onLiveRestarted(const std::shared_ptr<LiveFrame>& frame, const LiveRequest& request, const std::string& error){
+        frameShown();
+        if (request.generation != liveGeneration) return;
+        if (!error.empty()){
+            liveState = LiveState::Ready;
+            liveSettingsChanged = true;
+            syncClock();
+            ShowMessageBox(request.play ? "Start failed" : "Reset failed", error.c_str());
+            return;
+        }
+        liveParams = request.params;
+        if (gridFollowsMesh) edited.dims = frame->grid.dims;
+        showLiveFrame(*frame);
+        const double upper = std::max({static_cast<double>(COLOR_MAX_F), static_cast<double>(liveParams.panTemp),
+                                       static_cast<double>(hotTemp), coldTemp + 10.0});
+        rangeSlider->SetLimits(coldTemp + 10.0, upper);
+        liveState = request.play ? LiveState::Playing : LiveState::Ready;
+        syncClock();
+    }
+
+    void onLiveFrame(const std::shared_ptr<LiveFrame>& frame){
+        frameShown();
+        if (frame->generation != liveGeneration || liveState == LiveState::Preparing) return;
+        showLiveFrame(*frame);
+        if (frame->finished) liveState = LiveState::Finished;
+        syncClock();
+    }
+
+    void onLiveFailed(uint64_t generation, const std::string& error){
+        frameShown();
+        if (generation != liveGeneration) return;
+        liveState = LiveState::Finished;
+        liveSettingsChanged = true;
+        syncClock();
+        ShowMessageBox("Simulation failed", error.c_str());
+    }
+
     bool onKey(const gui::KeyEvent& e){
         if (e.type != gui::KeyEvent::DOWN) return false;
         if (resetting) return true;
@@ -1084,6 +1547,15 @@ private:
             case gui::KEY_C: setShowCookedColor(!showCookedColor); return true;
             case gui::KEY_I: setShowInitialColor(!showInitialColor); return true;
             case gui::KEY_V: setShowVolume(!showVolume); return true;
+            case gui::KEY_SPACE:
+                if (!live) return false;
+                startOrPause();
+                return true;
+            case gui::KEY_LEFT_BRACKET:
+            case gui::KEY_RIGHT_BRACKET:
+                if (!live) return false;
+                setSpeed(speedIndex + (e.key == gui::KEY_RIGHT_BRACKET ? 1 : -1));
+                return true;
             default: return false;
         }
     }
@@ -1114,6 +1586,9 @@ private:
     std::shared_ptr<open3d::geometry::Image> albedoImage;
     std::shared_ptr<open3d::geometry::Image> cookedAlbedo;
     bool cookedReady = false;
+    bool rebuildPosted = false;
+    rendering::TextureHandle surfaceTexture;  // albedo of the drawn surface, freed with it (see uniqueTexture)
+    bool holdsSurfaceTexture = false;
     std::shared_ptr<gui::SceneWidget> scene;
     std::shared_ptr<gui::Vert> panel;
     std::array<std::shared_ptr<gui::Label>, LEGEND_ROWS> legendLabels;
@@ -1128,25 +1603,59 @@ private:
     std::shared_ptr<steakui::TrackSlider> rangeSlider;
     std::shared_ptr<steakui::ResetProgressDialog> progressDialog;
     std::vector<SettingField> fields;
+
+    std::unique_ptr<LiveHeat> live;
+    gui::FontId clockFont = 0;
+    HeatParams liveParams;  // what the run on screen was set up with
+    LiveState liveState = LiveState::Ready;
+    bool liveSettingsChanged = false;
+    int speedIndex = 0;
+    std::string shownClock, shownStatus, shownButton;
+    std::shared_ptr<gui::Label> clockLabel;
+    std::shared_ptr<gui::Label> liveStatus;
+    std::shared_ptr<gui::Button> playButton;
+    std::shared_ptr<gui::Button> liveResetButton;
+    std::shared_ptr<gui::Combobox> speedCombo;
+    // Shared with the worker; guarded by liveMutex. The UI thread is the only writer of liveGeneration.
+    std::mutex liveMutex;
+    std::condition_variable liveWake;
+    uint64_t liveGeneration = 0;
+    bool liveQuit = false;
+    bool livePlaying = false;
+    bool liveResumed = false;
+    std::optional<LiveRequest> liveRequest;
+    double liveSpeed = LIVE_SPEEDS[0];
+    ViewState liveView;
+    int framesInFlight = 0;
+    std::thread liveWorker;
 };
 
-gui::FontId headingFont(){
+gui::FontId addFont(const char* typeface, int size, const char* what){
     try{
-        return gui::Application::GetInstance().AddFont(gui::FontDescription(gui::FontDescription::SANS_SERIF, gui::FontStyle::BOLD, 20));
+        return gui::Application::GetInstance().AddFont(gui::FontDescription(typeface, gui::FontStyle::BOLD, size));
     } catch (const std::exception& e){
-        std::cerr << "heat view: heading font unavailable (" << e.what() << ")\n";
+        std::cerr << "heat view: " << what << " font unavailable (" << e.what() << ")\n";
         return gui::Application::DEFAULT_FONT_ID;
     }
 }
 
+gui::FontId headingFont(){ return addFont(gui::FontDescription::SANS_SERIF, 20, "heading"); }
+
+// Fixed-width digits keep the clock from jittering as it counts.
+gui::FontId clockFont(){ return addFont(gui::FontDescription::MONOSPACE, 34, "clock"); }
+
 }  // namespace
 
 void printCenterColumn(const HeatGrid& grid, uint32_t rows){
-    const uint32_t cx = grid.dims.x / 2, cy = grid.dims.y / 2;
-    std::cout << "Temperature up the center column at t = " << grid.time << " s:\n";
-    for (uint32_t z = 0; z < std::min(grid.dims.z, rows); ++z){
-        const uint32_t kind = grid.kind(cx, cy, z);
-        std::cout << "  z = " << format("%5.1f", z * grid.spacing * MM_PER_M) << " mm: " << format("%6.1f", grid.at(cx, cy, z)) << " F"
+    const uint32_t axis = std::min(grid.panAxis, 2u);
+    const char* name[] = {"x", "y", "z"};
+    std::cout << "Temperature up the center column from the pan (along " << name[axis] << ") at t = " << grid.time << " s:\n";
+    for (uint32_t step = 0; step < std::min(grid.dims[axis], rows); ++step){
+        glm::uvec3 cell = grid.dims / 2u;
+        cell[axis] = step;
+        const uint32_t kind = grid.kind(cell.x, cell.y, cell.z);
+        std::cout << "  " << name[axis] << " = " << format("%5.1f", step * grid.spacing * MM_PER_M) << " mm: "
+                  << format("%6.1f", grid.at(cell.x, cell.y, cell.z)) << " F"
                   << (kind == CELL_PAN ? "  (pan)" : kind == CELL_AIR ? "  (air)" : "") << "\n";
     }
     std::cout << std::flush;
@@ -1159,5 +1668,20 @@ void showHeatGrid(const std::string& title, HeatGrid grid, const HeatParams& par
     const gui::FontId font = headingFont();
     app.AddWindow(std::make_shared<HeatViewWindow>(title, std::move(grid), params, steps, std::move(simulate), gridFollowsMesh,
                                                    std::move(surface), font));
+    app.Run();
+}
+
+void showLiveHeatGrid(const std::string& title, const HeatParams& params, std::unique_ptr<LiveHeat> live, bool gridFollowsMesh,
+                      HeatSurface surface){
+    if (!live) throw std::invalid_argument("showLiveHeatGrid: no simulation");
+    HeatGrid start = live->restart(params);
+    HeatParams shown = params;
+    if (gridFollowsMesh) shown.dims = start.dims;
+    auto& app = gui::Application::GetInstance();
+    app.Initialize(OPEN3D_RESOURCE_DIR);
+    const gui::FontId heading = headingFont();
+    const gui::FontId clock = clockFont();
+    app.AddWindow(std::make_shared<HeatViewWindow>(title, std::move(start), shown, liveStepCount(shown), HeatSimulator{},
+                                                   gridFollowsMesh, std::move(surface), heading, std::move(live), clock));
     app.Run();
 }

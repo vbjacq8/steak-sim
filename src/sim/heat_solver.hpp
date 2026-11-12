@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -27,6 +28,7 @@ struct HeatParams{
     float panTemp = 400.0f;         // F
     float airTemp = 212.0f;          // F; raise toward 212 to model steam
     float duration = 240.0f;        // simulated time for the viewers, s; the solver takes a step count
+    uint32_t panAxis = 2;           // makePanCells puts the pan in the low layer along this axis (0 x, 1 y, 2 z)
 
     // r = alpha dt / dx^2.
     float fourier() const { return diffusivity * timeStep / (spacing * spacing); }
@@ -53,6 +55,7 @@ struct HeatGrid{
     glm::uvec3 dims{};
     float spacing = 0.0f;
     float time = 0.0f;               // simulated seconds
+    uint32_t panAxis = 2;            // HeatParams::panAxis of the run; tells the viewer which side is the pan
     std::vector<float> temperature;  // degrees Fahrenheit; index = x + nx * (y + ny * z)
     std::vector<uint32_t> cells;     // CELL_* kinds the field was solved with, same indexing
     // Linear sRGB from the color simulation, one entry per cell. Empty when color is not run;
@@ -78,8 +81,8 @@ struct HeatGrid{
 };
 
 // Cell kinds for a grid that is CELL_SOLID where `solid` is nonzero (e.g. VoxelGrid::cells) and CELL_AIR
-// elsewhere, except that the whole z = 0 layer is the pan.
-std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid);
+// elsewhere, except that the whole low layer along `panAxis` (z = 0 by default) is the pan.
+std::vector<uint32_t> makePanCells(glm::uvec3 dims, const std::vector<uint32_t>& solid, uint32_t panAxis = 2);
 
 // A grid that is solid everywhere, with the z = 0 layer as the pan.
 std::vector<uint32_t> makeBlockCells(glm::uvec3 dims);
@@ -122,6 +125,8 @@ public:
                  uint32_t steps, const std::function<void(float)>& progress = {}, HeatStepHook* hook = nullptr);
 
 private:
+    friend class HeatSession;
+
     std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage,
                                                                    vk::MemoryPropertyFlags properties) const;
 
@@ -132,4 +137,51 @@ private:
     vk::raii::DescriptorSetLayout setLayout = nullptr;
     vk::raii::PipelineLayout pipelineLayout = nullptr;
     vk::raii::Pipeline pipeline = nullptr;
+};
+
+// One heat field kept on the GPU between calls, so it can be advanced a batch of steps at a time and read
+// back in between (a live view). Steps continue from where the last advance() stopped, and the hook sees
+// one sequential step index across all of them. Same validation and starting field as HeatSolver::run.
+// The solver and the hook must outlive the session; only one thread may use it (or the solver) at a time.
+class HeatSession{
+public:
+    HeatSession(const HeatSolver& solver, const HeatParams& params, const std::vector<uint32_t>& cells,
+                HeatStepHook* hook = nullptr);
+    HeatSession(const HeatSolver& solver, const HeatParams& params, const std::vector<uint32_t>& cells,
+                const std::vector<float>& initial, HeatStepHook* hook = nullptr);
+    HeatSession(const HeatSession&) = delete;
+    HeatSession& operator=(const HeatSession&) = delete;
+
+    // Runs `steps` more steps and waits for them.
+    void advance(uint32_t steps);
+    // The field after every step so far (time = stepsDone() * timeStep). Also runs the hook's readback.
+    HeatGrid read();
+    uint32_t stepsDone() const { return done; }
+
+private:
+    friend class HeatSolver;
+
+    vk::raii::CommandBuffer beginCommands() const;
+    void submit(vk::raii::CommandBuffer& commandBuffer) const;
+    void recordUploadOnce(vk::raii::CommandBuffer& commandBuffer);
+    void recordSteps(vk::raii::CommandBuffer& commandBuffer, uint32_t steps);
+    void recordReadback(vk::raii::CommandBuffer& commandBuffer);
+    HeatGrid download() const;
+
+    const HeatSolver& solver;
+    HeatParams params;
+    std::vector<uint32_t> cells;
+    HeatStepHook* hook = nullptr;
+    vk::DeviceSize bytes = 0;
+    vk::raii::Buffer staging = nullptr;  // initial field then cell kinds; the readback lands in the first half
+    vk::raii::DeviceMemory stagingMemory = nullptr;
+    vk::raii::Buffer cellBuffer = nullptr;
+    vk::raii::DeviceMemory cellMemory = nullptr;
+    // Ping-pong pair: step k reads fields[k % 2] and writes fields[(k + 1) % 2].
+    std::array<vk::raii::Buffer, 2> fields{nullptr, nullptr};
+    std::array<vk::raii::DeviceMemory, 2> fieldMemory{nullptr, nullptr};
+    vk::raii::DescriptorPool descriptorPool = nullptr;
+    std::array<vk::raii::DescriptorSet, 2> descriptorSets{nullptr, nullptr};
+    bool uploaded = false;
+    uint32_t done = 0;
 };
