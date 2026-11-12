@@ -53,9 +53,9 @@ ctest --test-dir build
 ## Roadmap
 
 - [x] Finite-difference heat diffusion over the voxel grid
-- [ ] Volume ray-marching shader for full 3D steak texture
-- [ ] Steak albedo texture blended with temperature colormap
-- [ ] Boundary conditions for pan contact and ambient cooling
+- [x] Volume ray-marching shader for full 3D steak texture
+- [x] Steak albedo texture blended with temperature colormap
+- [x] Boundary conditions for pan contact and ambient cooling
 
 ## Pipeline Samples (With a grilling example)
 Initial model load/render:
