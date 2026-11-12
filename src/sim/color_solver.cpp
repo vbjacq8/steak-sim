@@ -44,6 +44,10 @@ ColorSolver::ColorSolver(const vk::raii::Device& device, const vk::raii::Physica
         !(labFeatures & vk::FormatFeatureFlagBits::eStorageImage)){
         throw std::runtime_error("RGBA16F storage images are not supported");
     }
+    if (!(physicalDevice.getFormatProperties(vk::Format::eR32G32B32A32Sfloat).optimalTilingFeatures &
+          vk::FormatFeatureFlagBits::eStorageImage)){
+        throw std::runtime_error("RGBA32F storage images are not supported");
+    }
 
     commandPool = vk::raii::CommandPool(device, vk::CommandPoolCreateInfo{
         .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer, .queueFamilyIndex = queueFamilyIndex});
@@ -71,6 +75,7 @@ ColorSolver::ColorSolver(const vk::raii::Device& device, const vk::raii::Physica
         {3, vk::DescriptorType::eSampler, 1, compute},
         {4, vk::DescriptorType::eStorageImage, 1, compute},
         {5, vk::DescriptorType::eStorageImage, 1, compute},
+        {6, vk::DescriptorType::eStorageImage, 1, compute},
     });
     kineticsLayout = makeLayout({
         {0, vk::DescriptorType::eStorageBuffer, 1, compute},
@@ -78,6 +83,7 @@ ColorSolver::ColorSolver(const vk::raii::Device& device, const vk::raii::Physica
         {2, vk::DescriptorType::eStorageImage, 1, compute},
         {3, vk::DescriptorType::eStorageImage, 1, compute},
         {4, vk::DescriptorType::eStorageImage, 1, compute},
+        {5, vk::DescriptorType::eStorageImage, 1, compute},
     });
     exportLayout = makeLayout({
         {0, vk::DescriptorType::eStorageImage, 1, compute},
@@ -121,6 +127,7 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
     labValues.clear();
     rgbValues.clear();
     initialRgbValues.clear();
+    ratioValues.clear();
 
     const vk::DeviceSize cellBytes = count * sizeof(uint32_t);
     const vk::DeviceSize uvBytes = count * sizeof(glm::vec2);
@@ -131,6 +138,8 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
     std::tie(uvBuffer, uvMemory) = createBuffer(uvBytes, vk::BufferUsageFlagBits::eStorageBuffer, hostFlags);
     std::tie(exportBuffer, exportMemory) = createBuffer(exportBytes, vk::BufferUsageFlagBits::eStorageBuffer, hostFlags);
     std::tie(initialExportBuffer, initialExportMemory) = createBuffer(exportBytes, vk::BufferUsageFlagBits::eStorageBuffer, hostFlags);
+    std::tie(stateExportBuffer, stateExportMemory) =
+        createBuffer(count * sizeof(glm::vec4), vk::BufferUsageFlagBits::eTransferDst, hostFlags);
     std::memcpy(cellMemory.mapMemory(0, cellBytes), cells.data(), cellBytes);
     cellMemory.unmapMemory();
     std::memcpy(uvMemory.mapMemory(0, uvBytes), uv.data(), uvBytes);
@@ -147,6 +156,8 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
     lab0 = createImage(vk::ImageType::e3D, vk::Format::eR16G16B16A16Sfloat, volume, labUsage, vk::ImageViewType::e3D);
     labImage[0] = createImage(vk::ImageType::e3D, vk::Format::eR16G16B16A16Sfloat, volume, labUsage, vk::ImageViewType::e3D);
     labImage[1] = createImage(vk::ImageType::e3D, vk::Format::eR16G16B16A16Sfloat, volume, labUsage, vk::ImageViewType::e3D);
+    cookState = createImage(vk::ImageType::e3D, vk::Format::eR32G32B32A32Sfloat, volume,
+                            labUsage | vk::ImageUsageFlagBits::eTransferSrc, vk::ImageViewType::e3D);
 
     vk::raii::CommandBuffer commandBuffer = beginCommands();
     vk::ImageMemoryBarrier2 toTransfer{
@@ -203,8 +214,9 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
     vk::DescriptorImageInfo lab0Info{.imageView = lab0.view, .imageLayout = vk::ImageLayout::eGeneral};
     vk::DescriptorImageInfo labInfo[2]{{.imageView = labImage[0].view, .imageLayout = vk::ImageLayout::eGeneral},
                                        {.imageView = labImage[1].view, .imageLayout = vk::ImageLayout::eGeneral}};
+    vk::DescriptorImageInfo stateInfo{.imageView = cookState.view, .imageLayout = vk::ImageLayout::eGeneral};
 
-    std::array<vk::WriteDescriptorSet, 6> initWrites{{
+    std::array<vk::WriteDescriptorSet, 7> initWrites{{
         {.dstSet = initSet, .dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,
          .pBufferInfo = &cellsInfo},
         {.dstSet = initSet, .dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -217,6 +229,8 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
          .pImageInfo = &lab0Info},
         {.dstSet = initSet, .dstBinding = 5, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage,
          .pImageInfo = &labInfo[0]},
+        {.dstSet = initSet, .dstBinding = 6, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &stateInfo},
     }};
     std::array<vk::WriteDescriptorSet, 2> exportWrites{{
         {.dstSet = exportSet[0], .dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eStorageImage,
@@ -255,9 +269,10 @@ void ColorSolver::prepare(vk::Buffer temperature0, vk::Buffer temperature1){
     vk::DescriptorImageInfo lab0Info{.imageView = lab0.view, .imageLayout = vk::ImageLayout::eGeneral};
     vk::DescriptorImageInfo labInfo[2]{{.imageView = labImage[0].view, .imageLayout = vk::ImageLayout::eGeneral},
                                        {.imageView = labImage[1].view, .imageLayout = vk::ImageLayout::eGeneral}};
-    std::array<vk::WriteDescriptorSet, 10> writes{};
+    vk::DescriptorImageInfo stateInfo{.imageView = cookState.view, .imageLayout = vk::ImageLayout::eGeneral};
+    std::array<vk::WriteDescriptorSet, 12> writes{};
     for (int set = 0; set < 2; ++set){
-        const int base = set * 5;
+        const int base = set * 6;
         writes[base + 0] = {.dstSet = kineticsSet[set], .dstBinding = 0, .descriptorCount = 1,
                             .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &tempInfo[set]};
         writes[base + 1] = {.dstSet = kineticsSet[set], .dstBinding = 1, .descriptorCount = 1,
@@ -268,15 +283,17 @@ void ColorSolver::prepare(vk::Buffer temperature0, vk::Buffer temperature1){
                             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &lab0Info};
         writes[base + 4] = {.dstSet = kineticsSet[set], .dstBinding = 4, .descriptorCount = 1,
                             .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &labInfo[labOut[set]]};
+        writes[base + 5] = {.dstSet = kineticsSet[set], .dstBinding = 5, .descriptorCount = 1,
+                            .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &stateInfo};
     }
     device.updateDescriptorSets(writes, {});
 }
 
 void ColorSolver::recordInit(vk::raii::CommandBuffer& commandBuffer){
     completedSteps = 0;
-    const vk::Image images[3] = {*lab0.image, *labImage[0].image, *labImage[1].image};
-    std::array<vk::ImageMemoryBarrier2, 3> toGeneral{};
-    for (int i = 0; i < 3; ++i){
+    const vk::Image images[4] = {*lab0.image, *labImage[0].image, *labImage[1].image, *cookState.image};
+    std::array<vk::ImageMemoryBarrier2, 4> toGeneral{};
+    for (int i = 0; i < 4; ++i){
         toGeneral[i] = {.srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
                         .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                         .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
@@ -314,8 +331,16 @@ void ColorSolver::recordAfterStep(vk::raii::CommandBuffer& commandBuffer, uint32
 void ColorSolver::recordReadback(vk::raii::CommandBuffer& commandBuffer){
     dispatch(commandBuffer, *exportPipeline, *exportPipelineLayout, *exportSet[completedSteps % 2]);
     dispatch(commandBuffer, *exportPipeline, *exportPipelineLayout, *exportInitialSet);
-    vk::MemoryBarrier2 toHost{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+    vk::MemoryBarrier2 toCopy{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
                               .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+                              .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                              .dstAccessMask = vk::AccessFlagBits2::eTransferRead};
+    commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toCopy});
+    const vk::BufferImageCopy region{.imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+                                     .imageExtent = {dims.x, dims.y, dims.z}};
+    commandBuffer.copyImageToBuffer(*cookState.image, vk::ImageLayout::eGeneral, *stateExportBuffer, region);
+    vk::MemoryBarrier2 toHost{.srcStageMask = vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eCopy,
+                              .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
                               .dstStageMask = vk::PipelineStageFlagBits2::eHost,
                               .dstAccessMask = vk::AccessFlagBits2::eHostRead};
     commandBuffer.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &toHost});
@@ -336,6 +361,10 @@ void ColorSolver::download(){
     initialRgbValues.resize(count);
     for (size_t i = 0; i < count; ++i) initialRgbValues[i] = glm::vec3(initial[count + i]);
     initialExportMemory.unmapMemory();
+    auto* state = static_cast<const glm::vec4*>(stateExportMemory.mapMemory(0, count * sizeof(glm::vec4)));
+    ratioValues.resize(count);
+    for (size_t i = 0; i < count; ++i) ratioValues[i] = {state[i].x, state[i].z};
+    stateExportMemory.unmapMemory();
 }
 
 void ColorSolver::runExplicitTemperatures(const std::vector<std::vector<float>>& temperatureSteps){

@@ -306,16 +306,17 @@ bool isSurfaceCell(const HeatGrid& grid, int x, int y, int z){
     return false;
 }
 
-// Photo-resolution cook. Each surface voxel contributes its cooked a* at the texel it sampled.
-// L* and b* stay the albedo's, so marbling is not smeared across triangles.
+// Photo-resolution cook. Each surface voxel contributes its (L*/L*_0, a*/a*_0) at the texel it sampled,
+// and every texel is cooked from its own Lab with the nearest ratios, the same formula as the voxels.
+// Marbling stays the albedo's instead of being smeared across voxels.
 std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, const HeatSurface& surface){
     auto image = makeAlbedo(surface);
-    if (!image || grid.color.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
+    if (!image || grid.cookRatio.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
     const int width = surface.width;
     const int height = surface.height;
     const size_t texels = static_cast<size_t>(width) * height;
-    std::vector<float> aSum(texels, 0.0f);
-    std::vector<float> aWeight(texels, 0.0f);
+    std::vector<glm::vec2> ratioSum(texels, glm::vec2(0.0f));
+    std::vector<float> ratioWeight(texels, 0.0f);
     for (int z = 0; z < static_cast<int>(grid.dims.z); ++z){
         for (int y = 0; y < static_cast<int>(grid.dims.y); ++y){
             for (int x = 0; x < static_cast<int>(grid.dims.x); ++x){
@@ -325,22 +326,22 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
                 const int px = std::clamp(static_cast<int>(std::lround(uv.x * (width - 1))), 0, width - 1);
                 const int py = std::clamp(static_cast<int>(std::lround(uv.y * (height - 1))), 0, height - 1);
                 const size_t texel = static_cast<size_t>(py) * width + px;
-                aSum[texel] += linearSrgbToLab(grid.color[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))]).y;
-                aWeight[texel] += 1.0f;
+                ratioSum[texel] += grid.cookRatio[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
+                ratioWeight[texel] += 1.0f;
             }
         }
     }
 
     constexpr int kMaxSpread = 64;
     std::vector<int> distance(texels, kMaxSpread + 1);
-    std::vector<float> cookedA(texels, 0.0f);
+    std::vector<glm::vec2> ratio(texels, glm::vec2(1.0f));
     std::queue<std::pair<int, int>> wave;
     for (int y = 0; y < height; ++y){
         for (int x = 0; x < width; ++x){
             const size_t texel = static_cast<size_t>(y) * width + x;
-            if (!(aWeight[texel] > 0.0f)) continue;
+            if (!(ratioWeight[texel] > 0.0f)) continue;
             distance[texel] = 0;
-            cookedA[texel] = aSum[texel] / aWeight[texel];
+            ratio[texel] = ratioSum[texel] / ratioWeight[texel];
             wave.emplace(x, y);
         }
     }
@@ -358,7 +359,7 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
             const size_t nextTexel = static_cast<size_t>(ny) * width + nx;
             if (distance[nextTexel] <= next) continue;
             distance[nextTexel] = next;
-            cookedA[nextTexel] = cookedA[texel];
+            ratio[nextTexel] = ratio[texel];
             wave.emplace(nx, ny);
         }
     }
@@ -367,8 +368,7 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
         if (distance[texel] > kMaxSpread) continue;
         const size_t byte = texel * 3;
         const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
-        glm::vec3 lab = linearSrgbToLab(srgbToLinear(encoded));
-        lab.y = cookedA[texel];
+        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), ratio[texel]);
         const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
         image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
         image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));

@@ -45,7 +45,7 @@ add_custom_command(
           -target spirv -profile spirv_1_4 -emit-spirv-directly
           -fvk-use-entrypoint-name -entry colorKineticsMain
           -o ${COLOR_KINETICS_SPV}
-  DEPENDS ${COLOR_KINETICS_SRC}
+  DEPENDS ${COLOR_KINETICS_SRC} ${COMPUTE_SHADER_DIR}/cooking_kinetics.slang
   COMMENT "Compiling color kinetics shader"
   VERBATIM)
 
