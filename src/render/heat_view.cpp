@@ -409,12 +409,13 @@ std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, 
         peak.swap(grown);
     }
 
+    const ColorReference reference{grid.colorReferenceY, grid.colorReferenceA};
     for (size_t texel = 0; texel < peak.size(); ++texel){
         if (std::isnan(peak[texel])) continue;
         const size_t byte = texel * 3;
         const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
-        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), peak[texel], grid.colorReferenceY);
-        const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
+        const glm::vec3 lab0 = linearSrgbToLab(srgbToLinear(encoded));
+        const glm::vec3 out = linearToSrgb(labToLinearSrgb(cookedLab(lab0, peak[texel], reference)));
         image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
         image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));
         image->data_[byte + 2] = static_cast<uint8_t>(std::lround(out.z * 255.0f));

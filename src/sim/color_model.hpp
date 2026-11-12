@@ -114,19 +114,38 @@ struct Doneness{
     float strength = 0.0f;
 };
 
-// NaN and anything below the first key give zero strength.
-inline Doneness donenessAt(float peakCelsius){
+// Linear between keys; the last key holds above it. NaN and anything below the first key give zero
+// strength.
+template <int N>
+Doneness interpolateKeys(const DonenessKey (&keys)[N], float peakCelsius){
     Doneness d;
-    if (!(peakCelsius >= kDonenessKeys[0].celsius)) return d;
+    if (!(peakCelsius >= keys[0].celsius)) return d;
     int i = 0;
-    while (i < kDonenessKeyCount - 2 && peakCelsius >= kDonenessKeys[i + 1].celsius) ++i;
-    const DonenessKey& lo = kDonenessKeys[i];
-    const DonenessKey& hi = kDonenessKeys[i + 1];
+    while (i < N - 2 && peakCelsius >= keys[i + 1].celsius) ++i;
+    const DonenessKey& lo = keys[i];
+    const DonenessKey& hi = keys[i + 1];
     const float w = std::min((peakCelsius - lo.celsius) / (hi.celsius - lo.celsius), 1.0f);
     d.lab = lo.lab + (hi.lab - lo.lab) * w;
     d.strength = lo.strength + (hi.strength - lo.strength) * w;
     return d;
 }
+
+inline Doneness donenessAt(float peakCelsius){ return interpolateKeys(kDonenessKeys, peakCelsius); }
+
+// Fat renders (melts) from about 50 C and goes from opaque cream to golden, then grayish tan. Sampled
+// from fat caps in a photo of steaks cooked to known final internal temperatures; the cap sits beside
+// the center, so each sample is keyed to that temperature. Strength stays below 1 so a faint copy of
+// the texture's own fat pattern survives. The 50 C key repeats the first color so the blend starts
+// from zero strength without drifting toward another color.
+inline constexpr int kFatKeyCount = 4;
+inline constexpr DonenessKey kFatKeys[kFatKeyCount] = {
+    {50.0f, {64.9f, 11.7f, 23.6f}, 0.0f},
+    {57.2f, {64.9f, 11.7f, 23.6f}, 0.85f},  // medium-rare fat (135 F), sRGB (192, 149, 116)
+    {62.8f, {68.3f, 10.6f, 36.3f}, 0.85f},  // medium fat (145 F), (205, 158, 101)
+    {73.9f, {63.5f, 4.6f, 18.1f}, 0.85f},   // well-done fat (165 F), (174, 150, 122)
+};
+
+inline Doneness fatDonenessAt(float peakCelsius){ return interpolateKeys(kFatKeys, peakCelsius); }
 
 // How much of the texture's light/dark pattern survives cooking. The cooked color is the table color
 // scaled, in linear RGB, by (texel luminance / reference luminance)^kTextureDetail, so a texel as
@@ -137,15 +156,48 @@ inline constexpr float kTextureDetail = 0.5f;
 // CIE Y of a Lab color, on the same white as linearSrgbToLab.
 inline float labLuminance(glm::vec3 lab){ return labWhiteY() * labFInv((lab.x + 16.0f) / 116.0f); }
 
-// Lab of a texel with raw Lab `lab0` once its cell has peaked at `peakCelsius`. The doneness strength
-// is the cooked fraction: 0 keeps the texel, 1 gives the cooked color. `referenceY` is the luminance of
-// the texture's typical meat (ColorSolver::referenceLuminance).
-inline glm::vec3 cookedLab(glm::vec3 lab0, float peakCelsius, float referenceY){
+// The table's center colors are lean meat; fat does not redden, it only browns. A texel's meatiness is
+// its raw a* as a fraction of the texture's typical lean a*: at or below kFatRedness it cooks as fat,
+// at or above kLeanRedness as lean. Being relative, the ramp follows each texture's own redness.
+inline constexpr float kFatRedness = 0.25f;
+inline constexpr float kLeanRedness = 0.6f;
+
+// Between these peaks the center colors give way to crust browning, which applies to every texel:
+// the well-done center key and the first crust key.
+inline constexpr float kBrowningStartCelsius = 71.3f;
+inline constexpr float kBrowningFullCelsius = 152.8f;
+
+// Typical raw meat of a texture: median luminance and median a* of the texels the meat voxels sample.
+struct ColorReference{
+    float luminance = 0.0f;  // CIE Y
+    float redness = 0.0f;    // a*
+};
+
+// 0 for fat, 1 for lean. A texture with no red reference cooks everything as lean.
+inline float meatiness(float a0, float referenceRedness){
+    if (!(referenceRedness > 1.0f)) return 1.0f;
+    return std::clamp((a0 / referenceRedness - kFatRedness) / (kLeanRedness - kFatRedness), 0.0f, 1.0f);
+}
+
+// 0 below the browning range, 1 above it.
+inline float browning(float peakCelsius){
+    return std::clamp((peakCelsius - kBrowningStartCelsius) / (kBrowningFullCelsius - kBrowningStartCelsius), 0.0f, 1.0f);
+}
+
+// Lab of a texel with raw Lab `lab0` once its cell has peaked at `peakCelsius`. Fat first follows the
+// fat table; then the doneness strength (the cooked fraction: 0 keeps the color, 1 gives the cooked
+// color) applies, of which fat takes only the browning share. `reference` is ColorSolver::reference().
+inline glm::vec3 cookedLab(glm::vec3 lab0, float peakCelsius, ColorReference reference){
+    const float meat = meatiness(lab0.y, reference.redness);
+    const Doneness fat = fatDonenessAt(peakCelsius);
+    const glm::vec3 base = lab0 + (fat.lab - lab0) * ((1.0f - meat) * fat.strength);
     const Doneness d = donenessAt(peakCelsius);
-    if (!(d.strength > 0.0f)) return lab0;
-    const float detail = std::pow(std::max(labLuminance(lab0), 0.0f) / std::max(referenceY, 1.0e-4f), kTextureDetail);
+    const float strength = d.strength * (meat + (1.0f - meat) * browning(peakCelsius));
+    if (!(strength > 0.0f)) return base;
+    const float detail =
+        std::pow(std::max(labLuminance(lab0), 0.0f) / std::max(reference.luminance, 1.0e-4f), kTextureDetail);
     const glm::vec3 cooked = linearSrgbToLab(glm::clamp(labToLinearSrgb(d.lab) * detail, 0.0f, 1.0f));
-    return lab0 + (cooked - lab0) * d.strength;
+    return base + (cooked - base) * strength;
 }
 
 // Peak update after a heat step. `fahrenheit` is the heat-solver temperature; NaN keeps the peak.

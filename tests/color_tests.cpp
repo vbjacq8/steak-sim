@@ -80,13 +80,13 @@ TEST(ColorModel, DonenessTableInterpolation){
 
 TEST(ColorModel, CookedLabGoesFromRedToBrown){
     const glm::vec3 raw{52.8f, 41.2f, 27.0f};
-    const float referenceY = labLuminance(raw);
-    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius, referenceY), raw);
-    EXPECT_EQ(cookedLab(raw, 30.0f, referenceY), raw);
+    const ColorReference reference{labLuminance(raw), raw.y};
+    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius, reference), raw);
+    EXPECT_EQ(cookedLab(raw, 30.0f, reference), raw);
 
-    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f), referenceY);
-    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f), referenceY);
-    const glm::vec3 crust = cookedLab(raw, 170.0f, referenceY);
+    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f), reference);
+    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f), reference);
+    const glm::vec3 crust = cookedLab(raw, 170.0f, reference);
     EXPECT_LT(rare.y, raw.y);
     EXPECT_LT(wellDone.y, rare.y - 10.0f);
     EXPECT_GT(wellDone.x, rare.x);
@@ -99,16 +99,55 @@ TEST(ColorModel, CookedLabGoesFromRedToBrown){
 TEST(ColorModel, CookedColorKeepsTextureLightness){
     const glm::vec3 meat{52.8f, 41.2f, 27.0f};
     const glm::vec3 fat{85.0f, 4.0f, 15.0f};
-    const float referenceY = labLuminance(meat);
-    const glm::vec3 meatCrust = cookedLab(meat, 170.0f, referenceY);
-    const glm::vec3 fatCrust = cookedLab(fat, 170.0f, referenceY);
-    const glm::vec3 darkCrust = cookedLab({40.0f, 35.0f, 25.0f}, 170.0f, referenceY);
+    const ColorReference reference{labLuminance(meat), meat.y};
+    const glm::vec3 meatCrust = cookedLab(meat, 170.0f, reference);
+    const glm::vec3 fatCrust = cookedLab(fat, 170.0f, reference);
+    const glm::vec3 darkCrust = cookedLab({40.0f, 35.0f, 25.0f}, 170.0f, reference);
     EXPECT_GT(fatCrust.x, meatCrust.x + 5.0f);
     EXPECT_LT(fatCrust.x, fat.x);
     EXPECT_LT(darkCrust.x, meatCrust.x);
     // Scaling linear RGB keeps the table's hue: fat browns instead of staying white.
     EXPECT_GT(fatCrust.y, 5.0f);
     EXPECT_GT(fatCrust.z, 10.0f);
+}
+
+TEST(ColorModel, FatBrownsButDoesNotRedden){
+    const glm::vec3 meat{52.8f, 41.2f, 27.0f};
+    const glm::vec3 fat{85.0f, 4.0f, 15.0f};
+    const glm::vec3 marbling{75.0f, 15.0f, 18.0f};
+    const ColorReference reference{labLuminance(meat), meat.y};
+    EXPECT_EQ(meatiness(meat.y, reference.redness), 1.0f);
+    EXPECT_EQ(meatiness(fat.y, reference.redness), 0.0f);
+    EXPECT_GT(meatiness(marbling.y, reference.redness), 0.0f);
+    EXPECT_LT(meatiness(marbling.y, reference.redness), 1.0f);
+    EXPECT_EQ(meatiness(fat.y, 0.0f), 1.0f);
+
+    // Center temperatures never redden fat and only tint marbling. Fat is untouched until it starts to
+    // render, then follows the fat table.
+    EXPECT_EQ(cookedLab(fat, kFatKeys[0].celsius, reference), fat);
+    for (float celsius : {49.0f, 55.0f, 65.0f, 71.0f}){
+        EXPECT_LE(cookedLab(fat, celsius, reference).y, 12.0f) << celsius;
+        EXPECT_GT(cookedLab(marbling, celsius, reference).x, cookedLab(meat, celsius, reference).x) << celsius;
+    }
+    // Below the browning range, a fat texel sits exactly at its blend toward each fat key.
+    for (int k = 1; k < kFatKeyCount && kFatKeys[k].celsius <= kBrowningStartCelsius; ++k){
+        const DonenessKey& key = kFatKeys[k];
+        EXPECT_LT(channelError(cookedLab(fat, key.celsius, reference), fat + (key.lab - fat) * key.strength), 1e-4f) << key.celsius;
+    }
+    const glm::vec3 half = cookedLab(fat, 0.5f * (kFatKeys[0].celsius + kFatKeys[1].celsius), reference);
+    EXPECT_GT(half.z, fat.z);
+    EXPECT_LT(half.z, cookedLab(fat, kFatKeys[1].celsius, reference).z);
+    EXPECT_EQ(kFatKeys[0].lab, kFatKeys[1].lab);
+    // Part way to crust temperatures fat starts to brown; at crust it browns fully.
+    EXPECT_LT(cookedLab(fat, 110.0f, reference).x, fat.x - 5.0f);
+    EXPECT_GT(cookedLab(fat, 110.0f, reference).x, cookedLab(fat, kBrowningFullCelsius, reference).x);
+    const glm::vec3 crust = cookedLab(fat, 170.0f, reference);
+    EXPECT_LT(crust.x, 60.0f);
+    EXPECT_GT(crust.y, 5.0f);
+
+    // The browning range starts at the well-done center key and ends at the first crust key.
+    EXPECT_FLOAT_EQ(kBrowningStartCelsius, kDonenessKeys[kDonenessKeyCount - 3].celsius);
+    EXPECT_FLOAT_EQ(kBrowningFullCelsius, kDonenessKeys[kDonenessKeyCount - 2].celsius);
 }
 
 TEST(ColorModel, PeakOnlyRises){
@@ -187,8 +226,9 @@ TEST(ColorSolver, GpuColorMatchesCpu){
 
     float peak = kNoPeakCelsius;
     for (float temperature : schedule) peak = raisePeak(peak, temperature);
-    EXPECT_GT(solved.referenceLuminance(), 0.0f);
-    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak, solved.referenceLuminance());
+    EXPECT_GT(solved.reference().luminance, 0.0f);
+    EXPECT_NEAR(solved.reference().redness, lab0.y, 0.5f);
+    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak, solved.reference());
     EXPECT_NEAR(solved.lab()[0].x, expected.x, 0.25f);
     EXPECT_NEAR(solved.lab()[0].y, expected.y, 0.25f);
     EXPECT_NEAR(solved.lab()[0].z, expected.z, 0.25f);

@@ -43,12 +43,53 @@ static const float TEXTURE_DETAIL = 0.5;
 
 float labLuminance(float3 lab) { return labWhiteY() * labFInv((lab.x + 16.0) / 116.0); }
 
-// w of donenessAt is the cooked fraction. The cooked color is the table color scaled by
-// (texel luminance / referenceY)^TEXTURE_DETAIL in linear RGB.
-float3 cookedLab(float3 lab0, float peakCelsius, float referenceY) {
+// Fat/lean ramp as fractions of the reference a* (kFatRedness, kLeanRedness), and the peak range where
+// crust browning takes over from the center colors (kBrowningStartCelsius, kBrowningFullCelsius).
+static const float FAT_REDNESS = 0.25;
+static const float LEAN_REDNESS = 0.6;
+static const float BROWNING_START_CELSIUS = 71.3;
+static const float BROWNING_FULL_CELSIUS = 152.8;
+
+float meatiness(float a0, float referenceA) {
+    if (!(referenceA > 1.0)) return 1.0;
+    return clamp((a0 / referenceA - FAT_REDNESS) / (LEAN_REDNESS - FAT_REDNESS), 0.0, 1.0);
+}
+
+float browning(float peakCelsius) {
+    return clamp((peakCelsius - BROWNING_START_CELSIUS) / (BROWNING_FULL_CELSIUS - BROWNING_START_CELSIUS), 0.0, 1.0);
+}
+
+// Fat table (kFatKeys in color_model.hpp).
+static const uint FAT_KEY_COUNT = 4;
+static const DonenessKey FAT_KEYS[4] = {
+    { 50.0, float3(64.9, 11.7, 23.6), 0.0 },
+    { 57.2, float3(64.9, 11.7, 23.6), 0.85 },
+    { 62.8, float3(68.3, 10.6, 36.3), 0.85 },
+    { 73.9, float3(63.5, 4.6, 18.1), 0.85 },
+};
+
+// Same interpolation as donenessAt, over FAT_KEYS.
+float4 fatDonenessAt(float peakCelsius) {
+    if (!(peakCelsius >= FAT_KEYS[0].celsius)) return float4(0.0, 0.0, 0.0, 0.0);
+    uint i = 0;
+    while (i < FAT_KEY_COUNT - 2 && peakCelsius >= FAT_KEYS[i + 1].celsius) ++i;
+    DonenessKey lo = FAT_KEYS[i];
+    DonenessKey hi = FAT_KEYS[i + 1];
+    float w = min((peakCelsius - lo.celsius) / (hi.celsius - lo.celsius), 1.0);
+    return float4(lo.lab + (hi.lab - lo.lab) * w, lo.strength + (hi.strength - lo.strength) * w);
+}
+
+// Fat first follows the fat table. Then w of donenessAt, the cooked fraction, applies; fat takes only
+// its browning share. The cooked color is the table color scaled by (texel luminance / referenceY)^
+// TEXTURE_DETAIL in linear RGB. referenceY and referenceA are the median luminance and a* of the meat.
+float3 cookedLab(float3 lab0, float peakCelsius, float referenceY, float referenceA) {
+    float meat = meatiness(lab0.y, referenceA);
+    float4 fat = fatDonenessAt(peakCelsius);
+    float3 base = lab0 + (fat.xyz - lab0) * ((1.0 - meat) * fat.w);
     float4 d = donenessAt(peakCelsius);
-    if (!(d.w > 0.0)) return lab0;
+    float strength = d.w * (meat + (1.0 - meat) * browning(peakCelsius));
+    if (!(strength > 0.0)) return base;
     float detail = pow(max(labLuminance(lab0), 0.0) / max(referenceY, 1.0e-4), TEXTURE_DETAIL);
     float3 cooked = linearSrgbToLab(clamp(labToLinearSrgb(d.xyz) * detail, 0.0, 1.0));
-    return lab0 + (cooked - lab0) * d.w;
+    return base + (cooked - base) * strength;
 }

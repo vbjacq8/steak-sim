@@ -48,7 +48,8 @@ float4 fragMain(VSOutput vertIn) : SV_TARGET {
     float tF = ubo.cook.y;
     float seconds = ubo.cook.x;
     float tC = (tF - 32.0) * (5.0 / 9.0);
-    // No voxel grid to take a median from, so the reference is mid-gray luminance (L* 50).
-    if (seconds > 0.0) lab = cookedLab(lab, tC, 0.1842);
+    // No voxel grid to take medians from: the luminance reference is L* 50 and there is no redness
+    // reference, so every texel cooks as lean.
+    if (seconds > 0.0) lab = cookedLab(lab, tC, 0.1842, 0.0);
     return float4(labToLinearSrgb(lab), sampled.a);
 }

@@ -15,8 +15,9 @@ namespace {
 struct ColorPush{
     glm::uvec3 dims;
     float referenceY;
+    float referenceA;
 };
-static_assert(sizeof(ColorPush) == 16);
+static_assert(sizeof(ColorPush) == 20);
 
 constexpr vk::ImageSubresourceRange kColorRange{
     .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
@@ -30,23 +31,30 @@ std::vector<char> readFile(const std::string& filename){
     return buffer;
 }
 
-// Median CIE Y of the texels the solid cells sample, nearest texel. Fat and marbling are a minority
-// of a steak, so this lands on typical meat.
-float medianSolidLuminance(const std::vector<uint32_t>& cells, const std::vector<glm::vec2>& uv, const uint8_t* rgba,
-                           uint32_t width, uint32_t height){
+float median(std::vector<float> values){
+    auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
+}
+
+// Median CIE Y and a* of the texels the solid cells sample, nearest texel. Fat and marbling are a
+// minority of a steak, so both land on typical lean.
+ColorReference solidReference(const std::vector<uint32_t>& cells, const std::vector<glm::vec2>& uv, const uint8_t* rgba,
+                              uint32_t width, uint32_t height){
     std::vector<float> luminance;
+    std::vector<float> redness;
     for (size_t i = 0; i < cells.size(); ++i){
         if (cells[i] != CELL_SOLID) continue;
         const auto x = static_cast<uint32_t>(std::clamp(uv[i].x * static_cast<float>(width), 0.0f, static_cast<float>(width - 1)));
         const auto y = static_cast<uint32_t>(std::clamp(uv[i].y * static_cast<float>(height), 0.0f, static_cast<float>(height - 1)));
         const uint8_t* texel = rgba + (size_t(y) * width + x) * 4;
         const glm::vec3 linear = srgbToLinear(glm::vec3(texel[0], texel[1], texel[2]) / 255.0f);
-        luminance.push_back(labLuminance(linearSrgbToLab(linear)));
+        const glm::vec3 lab = linearSrgbToLab(linear);
+        luminance.push_back(labLuminance(lab));
+        redness.push_back(lab.y);
     }
-    if (luminance.empty()) return labLuminance({50.0f, 0.0f, 0.0f});
-    auto middle = luminance.begin() + static_cast<std::ptrdiff_t>(luminance.size() / 2);
-    std::nth_element(luminance.begin(), middle, luminance.end());
-    return *middle;
+    if (luminance.empty()) return {labLuminance({50.0f, 0.0f, 0.0f}), 0.0f};
+    return {median(std::move(luminance)), median(std::move(redness))};
 }
 
 vk::raii::ShaderModule loadModule(const vk::raii::Device& device, const std::string& path){
@@ -140,7 +148,7 @@ void ColorSolver::prepareGrid(glm::uvec3 dimsIn, const std::vector<uint32_t>& ce
 
     dims = dimsIn;
     dt = dtSeconds;
-    referenceY = medianSolidLuminance(cells, uv, rgba, width, height);
+    colorReference = solidReference(cells, uv, rgba, width, height);
     completedSteps = 0;
     labValues.clear();
     rgbValues.clear();
@@ -421,7 +429,7 @@ void ColorSolver::dispatch(vk::raii::CommandBuffer& commandBuffer, vk::Pipeline 
                            vk::DescriptorSet set) const{
     commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, layout, 0, set, nullptr);
-    commandBuffer.pushConstants<ColorPush>(layout, vk::ShaderStageFlagBits::eCompute, 0, ColorPush{.dims = dims, .referenceY = referenceY});
+    commandBuffer.pushConstants<ColorPush>(layout, vk::ShaderStageFlagBits::eCompute, 0, ColorPush{.dims = dims, .referenceY = colorReference.luminance, .referenceA = colorReference.redness});
     const glm::uvec3 groups = (dims + glm::uvec3(3u)) / glm::uvec3(4u);
     commandBuffer.dispatch(groups.x, groups.y, groups.z);
 }

@@ -30,8 +30,11 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -104,52 +107,157 @@ struct DemoMesh{
     float metersPerUnit = 0.01f;
 };
 
-// Texture coordinates for a part's vertical walls whose own coordinates have no area, as when a model is
-// mapped by projecting straight down. The angle around the part's center runs across the part's UV box,
-// mirrored at 0 and pi so there is no seam, and height runs up it at the same texel density.
+// A model mapped by projecting straight down squeezes each vertical wall into a line of texels. Such
+// wall triangles get new coordinates: distance along the wall's outline runs across the part's UV box
+// and height runs up it at the same texel density, so the texture is neither squeezed nor folded
+// where the outline turns back on itself (the notch of a ribeye).
 struct WallMapping{
-    glm::vec2 center{};
+    std::unordered_map<uint32_t, float> arc;  // source vertex -> distance along the outline, model units
+    float perimeter = 0.0f;
+    bool closed = false;
     float zLow = 0.0f;
-    glm::vec2 uvLow{};
-    glm::vec2 uvHigh{};
+    float vStart = 0.0f;
+    float uStart = 0.0f;
+    float uPerUnit = 0.0f;
     float vPerUnit = 0.0f;
 
-    glm::vec2 uv(glm::vec3 p) const{
-        const float angle = std::abs(std::atan2(p.y - center.y, p.x - center.x)) / 3.14159265f;
-        return {uvLow.x + (uvHigh.x - uvLow.x) * angle, std::min(uvLow.y + (p.z - zLow) * vPerUnit, uvHigh.y)};
+    // A closed outline runs out over its first half and back over the second, so the texture meets
+    // itself everywhere instead of at a seam.
+    glm::vec2 uv(const Mesh& mesh, uint32_t vertex) const{
+        const float s = arc.at(vertex);
+        const float along = closed ? std::min(s, perimeter - s) : s;
+        return {uStart + along * uPerUnit, vStart + (mesh.positions[vertex].z - zLow) * vPerUnit};
     }
 };
 
-bool isFlatWall(const Mesh& mesh, const uint32_t tri[3]){
-    const glm::vec3 a = mesh.positions[tri[0]], b = mesh.positions[tri[1]], c = mesh.positions[tri[2]];
-    const glm::vec3 normal = glm::cross(b - a, c - a);
-    const float area = glm::length(normal);
-    if (!(area > 0.0f) || std::abs(normal.z) > 0.5f * area) return false;
-    const glm::vec2 e1 = mesh.texcoords[tri[1]] - mesh.texcoords[tri[0]];
-    const glm::vec2 e2 = mesh.texcoords[tri[2]] - mesh.texcoords[tri[0]];
-    return std::abs(e1.x * e2.y - e1.y * e2.x) < 1.0e-10f;
+float uvArea(glm::vec2 a, glm::vec2 b, glm::vec2 c){
+    const glm::vec2 e1 = b - a;
+    const glm::vec2 e2 = c - a;
+    return 0.5f * std::abs(e1.x * e2.y - e1.y * e2.x);
 }
 
-WallMapping wallMapping(const Mesh& mesh, const MeshPart& part, int imageWidth, int imageHeight){
+// Per triangle of `part`: within 60 degrees of vertical, with under 5% of the texture area per model
+// area that the part's flat faces get.
+std::vector<bool> collapsedWalls(const Mesh& mesh, const MeshPart& part){
+    const uint32_t count = part.indexCount / 3;
+    std::vector<float> density(count, 0.0f);
+    std::vector<bool> steep(count, false);
+    std::vector<float> flatDensity;
+    for (uint32_t t = 0; t < count; ++t){
+        const uint32_t* tri = &mesh.indices[part.indexOffset + 3 * t];
+        const glm::vec3 a = mesh.positions[tri[0]], b = mesh.positions[tri[1]], c = mesh.positions[tri[2]];
+        const glm::vec3 normal = glm::cross(b - a, c - a);
+        const float length = glm::length(normal);
+        if (!(length > 0.0f)) continue;
+        density[t] = uvArea(mesh.texcoords[tri[0]], mesh.texcoords[tri[1]], mesh.texcoords[tri[2]]) / (0.5f * length);
+        steep[t] = std::abs(normal.z) < 0.5f * length;
+        if (std::abs(normal.z) > 0.9f * length) flatDensity.push_back(density[t]);
+    }
+    std::vector<bool> walls(count, false);
+    if (flatDensity.empty()) return walls;
+    auto middle = flatDensity.begin() + static_cast<std::ptrdiff_t>(flatDensity.size() / 2);
+    std::nth_element(flatDensity.begin(), middle, flatDensity.end());
+    const float threshold = 0.05f * *middle;
+    for (uint32_t t = 0; t < count; ++t) walls[t] = steep[t] && density[t] < threshold;
+    return walls;
+}
+
+WallMapping wallMapping(const Mesh& mesh, const MeshPart& part, const std::vector<bool>& walls, int imageWidth,
+                        int imageHeight){
     WallMapping mapping;
-    glm::vec3 low(std::numeric_limits<float>::infinity());
-    glm::vec3 high(-std::numeric_limits<float>::infinity());
-    mapping.uvLow = glm::vec2(std::numeric_limits<float>::infinity());
-    mapping.uvHigh = glm::vec2(-std::numeric_limits<float>::infinity());
+    glm::vec2 low(std::numeric_limits<float>::infinity());
+    glm::vec2 high(-std::numeric_limits<float>::infinity());
+    glm::vec2 uvLow(std::numeric_limits<float>::infinity());
+    glm::vec2 uvHigh(-std::numeric_limits<float>::infinity());
     for (uint32_t n = 0; n < part.indexCount; ++n){
         const uint32_t i = mesh.indices[part.indexOffset + n];
-        low = glm::min(low, mesh.positions[i]);
-        high = glm::max(high, mesh.positions[i]);
-        mapping.uvLow = glm::min(mapping.uvLow, mesh.texcoords[i]);
-        mapping.uvHigh = glm::max(mapping.uvHigh, mesh.texcoords[i]);
+        low = glm::min(low, glm::vec2(mesh.positions[i]));
+        high = glm::max(high, glm::vec2(mesh.positions[i]));
+        uvLow = glm::min(uvLow, mesh.texcoords[i]);
+        uvHigh = glm::max(uvHigh, mesh.texcoords[i]);
     }
-    mapping.center = 0.5f * (glm::vec2(low) + glm::vec2(high));
-    mapping.zLow = low.z;
-    // Half the perimeter of the part's bounding ellipse spans the U range.
-    const glm::vec2 radius = 0.5f * (glm::vec2(high) - glm::vec2(low));
-    const float halfPerimeter = 3.14159265f * std::sqrt(0.5f * (radius.x * radius.x + radius.y * radius.y));
-    const float pixelsPerUnit = (mapping.uvHigh.x - mapping.uvLow.x) * static_cast<float>(imageWidth) / std::max(halfPerimeter, 1.0e-6f);
-    mapping.vPerUnit = pixelsPerUnit / static_cast<float>(imageHeight);
+
+    // Wall vertices stacked at the same xy form one column of the outline.
+    const float quantum = 1.0e-4f * std::max(glm::length(high - low), 1.0e-6f);
+    std::map<std::pair<long, long>, int> columnOf;
+    std::vector<glm::vec2> columns;
+    std::unordered_map<uint32_t, int> vertexColumn;
+    std::vector<std::set<int>> neighbors;
+    mapping.zLow = std::numeric_limits<float>::infinity();
+    float zHigh = -std::numeric_limits<float>::infinity();
+    for (uint32_t t = 0; t < walls.size(); ++t){
+        if (!walls[t]) continue;
+        const uint32_t* tri = &mesh.indices[part.indexOffset + 3 * t];
+        int ids[3];
+        for (int c = 0; c < 3; ++c){
+            const glm::vec3 p = mesh.positions[tri[c]];
+            mapping.zLow = std::min(mapping.zLow, p.z);
+            zHigh = std::max(zHigh, p.z);
+            const std::pair<long, long> key{std::lround(p.x / quantum), std::lround(p.y / quantum)};
+            auto [it, added] = columnOf.emplace(key, static_cast<int>(columns.size()));
+            if (added){
+                columns.emplace_back(p.x, p.y);
+                neighbors.emplace_back();
+            }
+            ids[c] = it->second;
+            vertexColumn[tri[c]] = it->second;
+        }
+        for (int c = 0; c < 3; ++c){
+            const int from = ids[c];
+            const int to = ids[(c + 1) % 3];
+            if (from == to) continue;
+            neighbors[static_cast<size_t>(from)].insert(to);
+            neighbors[static_cast<size_t>(to)].insert(from);
+        }
+    }
+    if (columns.empty()) return mapping;
+
+    // Walk each connected outline, starting at an open end when it has one.
+    std::vector<float> arc(columns.size(), 0.0f);
+    std::vector<bool> visited(columns.size(), false);
+    float travelled = 0.0f;
+    for (size_t seed = 0; seed < columns.size(); ++seed){
+        if (visited[seed]) continue;
+        int start = static_cast<int>(seed);
+        for (size_t c = 0; c < columns.size(); ++c){
+            if (!visited[c] && neighbors[c].size() == 1){
+                start = static_cast<int>(c);
+                break;
+            }
+        }
+        int current = start;
+        int last = start;
+        while (current >= 0){
+            visited[static_cast<size_t>(current)] = true;
+            travelled += glm::length(columns[static_cast<size_t>(current)] - columns[static_cast<size_t>(last)]);
+            arc[static_cast<size_t>(current)] = travelled;
+            last = current;
+            int next = -1;
+            for (int candidate : neighbors[static_cast<size_t>(current)]){
+                if (!visited[static_cast<size_t>(candidate)]){
+                    next = candidate;
+                    break;
+                }
+            }
+            current = next;
+        }
+        // A closed outline also spans the step from its last column back to the first.
+        if (last != start && neighbors[static_cast<size_t>(last)].count(start)){
+            travelled += glm::length(columns[static_cast<size_t>(start)] - columns[static_cast<size_t>(last)]);
+            mapping.closed = true;
+        }
+    }
+    mapping.perimeter = travelled;
+    for (const auto& [vertex, column] : vertexColumn) mapping.arc[vertex] = arc[static_cast<size_t>(column)];
+
+    // The outline spans the part's U range (half the outline when it is mirrored). The strip of the
+    // wall's height sits in the middle of the V range, away from the image edges.
+    const float span = (mapping.closed ? 0.5f : 1.0f) * mapping.perimeter;
+    mapping.uStart = uvLow.x;
+    mapping.uPerUnit = (uvHigh.x - uvLow.x) / std::max(span, 1.0e-6f);
+    mapping.vPerUnit = mapping.uPerUnit * static_cast<float>(imageWidth) / static_cast<float>(imageHeight);
+    const float stripHeight = (zHigh - mapping.zLow) * mapping.vPerUnit;
+    mapping.vStart = std::max(uvLow.y, 0.5f * (uvLow.y + uvHigh.y - stripHeight));
     return mapping;
 }
 
@@ -224,14 +332,15 @@ DemoMesh prepareDemoMesh(const Mesh& source, const std::string& fallbackTexture)
                 throw std::runtime_error("mesh part index is out of range");
             }
         }
-        const WallMapping walls = wallMapping(mesh, part, src.width, src.height);
+        const std::vector<bool> walls = collapsedWalls(mesh, part);
+        const WallMapping wallUvs = wallMapping(mesh, part, walls, src.width, src.height);
         std::vector<int> remap(mesh.positions.size(), -1);
         for (uint32_t n = 0; n < part.indexCount; n += 3){
             const uint32_t tri[3] = {mesh.indices[part.indexOffset + n], mesh.indices[part.indexOffset + n + 1],
                                      mesh.indices[part.indexOffset + n + 2]};
-            if (isFlatWall(mesh, tri)){
+            if (walls[n / 3]){
                 ++rewrapped;
-                for (uint32_t srcIndex : tri) out.indices.push_back(addVertex(mesh.positions[srcIndex], walls.uv(mesh.positions[srcIndex])));
+                for (uint32_t srcIndex : tri) out.indices.push_back(addVertex(mesh.positions[srcIndex], wallUvs.uv(mesh, srcIndex)));
                 continue;
             }
             for (uint32_t srcIndex : tri){

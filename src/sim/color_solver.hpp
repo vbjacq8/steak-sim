@@ -1,5 +1,6 @@
 #pragma once
 
+#include "color_model.hpp"
 #include "heat_solver.hpp"
 
 #include <cstdint>
@@ -49,8 +50,8 @@ public:
     const std::vector<glm::vec3>& initialLinearRgb() const { return initialRgbValues; }
     // Hottest temperature each cell reached, Celsius; kNoPeakCelsius where no step ran or the cell is not solid.
     const std::vector<float>& peakCelsius() const { return peakValues; }
-    // Median luminance (CIE Y) of the texels the solid cells sample; cookedLab's referenceY.
-    float referenceLuminance() const { return referenceY; }
+    // Median luminance and a* of the texels the solid cells sample; cookedLab's reference.
+    const ColorReference& reference() const { return colorReference; }
 
 private:
     struct GpuImage{
@@ -106,7 +107,7 @@ private:
 
     glm::uvec3 dims{};
     float dt = 1.0f;
-    float referenceY = 0.0f;
+    ColorReference colorReference;
     uint32_t completedSteps = 0;
     std::vector<glm::vec4> labValues;
     std::vector<glm::vec3> rgbValues;

@@ -55,7 +55,8 @@ SteakHeatResult simulateMeshHeatColor(const ComputeContext& ctx, const std::vect
     result.heat.color = color.linearRgb();
     result.heat.initialColor = color.initialLinearRgb();
     result.heat.peakCelsius = color.peakCelsius();
-    result.heat.colorReferenceY = color.referenceLuminance();
+    result.heat.colorReferenceY = color.reference().luminance;
+    result.heat.colorReferenceA = color.reference().redness;
     result.heat.sampleUv = result.voxels.uv;
     return result;
 }
