@@ -57,15 +57,28 @@ ctest --test-dir build
 - [ ] Steak albedo texture blended with temperature colormap
 - [ ] Boundary conditions for pan contact and ambient cooling
 
-## Samples
-Initial model load/render
+## Pipeline Samples (With a grilling example)
+Initial model load/render:
 
-![Initial model](samples/initial-object.png)
+![](samples/stk-raw-render.png)
 
-Model after conservative voxelization
+Model undergoes conservative voxelization:
 
-![Model after conservative voxelization](samples/voxelized-object.png)
+![](samples/stk-voxelized.png)
 
-View of resulting heat simulation
+Model texture is sampled to 3D texture image:
 
-![Heat equation solver carried out on the resulting voxels](samples/heated-object.png)
+![](samples/stk-raw-texels.png)
+
+Model voxels go under 3D FDM to solve Heat Diffusion; 3D texture image is updated with new colors at each step
+
+![](samples/stk-cooked-heatmap2.png)
+![](samples/stk-cooked-heatmap.png)
+
+3D texture image is sampled in the final render
+
+![](samples/stk-cooked-render.png)
+
+
+
+
