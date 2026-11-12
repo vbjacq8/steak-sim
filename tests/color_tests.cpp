@@ -35,18 +35,6 @@ float channelError(glm::vec3 a, glm::vec3 b){
     return std::max(std::abs(a.x - b.x), std::max(std::abs(a.y - b.y), std::abs(a.z - b.z)));
 }
 
-float simulateRamp(float dt, float totalSeconds){
-    const int steps = static_cast<int>(std::lround(totalSeconds / dt));
-    float a = 25.0f;
-    for (int i = 0; i < steps; ++i){
-        const float u = (static_cast<float>(i) + 0.5f) / static_cast<float>(steps);
-        const float celsius = 30.0f + u * 60.0f;
-        const float fahrenheit = celsius * 9.0f / 5.0f + 32.0f;
-        a = stepLabA(a, 25.0f, fahrenheit, dt);
-    }
-    return a;
-}
-
 TEST(ColorModel, LabRoundTrip){
     const glm::vec3 white = linearSrgbToLab({1.0f, 1.0f, 1.0f});
     EXPECT_NEAR(white.x, 100.0f, 1e-3f);
@@ -63,32 +51,110 @@ TEST(ColorModel, LabRoundTrip){
     }
 }
 
-TEST(ColorModel, KineticsMovesTowardEquilibrium){
-    const float cold = arrheniusK(fahrenheitToCelsius(100.0f) + 273.15f);
-    const float hot = arrheniusK(fahrenheitToCelsius(300.0f) + 273.15f);
-    EXPECT_GT(hot, cold);
-    EXPECT_LT(equilibriumA(20.0f, 90.0f), equilibriumA(20.0f, 40.0f));
-    EXPECT_FLOAT_EQ(stepLabA(12.0f, 20.0f, -500.0f, 1.0f), 12.0f);
+TEST(ColorModel, DonenessTableInterpolation){
+    EXPECT_EQ(donenessAt(39.9f).strength, 0.0f);
+    EXPECT_EQ(donenessAt(kNoPeakCelsius).strength, 0.0f);
+    EXPECT_EQ(donenessAt(std::nanf("")).strength, 0.0f);
 
-    const float a0 = 20.0f;
-    const float aInf = equilibriumA(a0, fahrenheitToCelsius(212.0f));
-    float a = a0;
-    float previous = std::abs(a - aInf);
-    for (int i = 0; i < 80; ++i){
-        a = stepLabA(a, a0, 212.0f, 1.0f);
-        const float distance = std::abs(a - aInf);
-        EXPECT_LT(distance, previous);
-        previous = distance;
+    for (const DonenessKey& key : kDonenessKeys){
+        const Doneness d = donenessAt(key.celsius);
+        EXPECT_FLOAT_EQ(d.strength, key.strength) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.x, key.lab.x) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.y, key.lab.y) << key.celsius;
+        EXPECT_FLOAT_EQ(d.lab.z, key.lab.z) << key.celsius;
     }
-    EXPECT_LT(std::abs(a - aInf), 0.2f);
+
+    const Doneness between = donenessAt(0.5f * (kDonenessKeys[2].celsius + kDonenessKeys[3].celsius));
+    EXPECT_FLOAT_EQ(between.strength, 0.5f * (kDonenessKeys[2].strength + kDonenessKeys[3].strength));
+    EXPECT_FLOAT_EQ(between.lab.x, 0.5f * (kDonenessKeys[2].lab.x + kDonenessKeys[3].lab.x));
+
+    const DonenessKey& last = kDonenessKeys[kDonenessKeyCount - 1];
+    const Doneness hot = donenessAt(400.0f);
+    EXPECT_FLOAT_EQ(hot.strength, last.strength);
+    EXPECT_FLOAT_EQ(hot.lab.x, last.lab.x);
+
+    for (int i = 1; i < kDonenessKeyCount; ++i) EXPECT_GT(kDonenessKeys[i].celsius, kDonenessKeys[i - 1].celsius);
+    // The zero-strength key shares the next key's color, so the blend never drifts toward another color.
+    EXPECT_EQ(kDonenessKeys[0].lab, kDonenessKeys[1].lab);
 }
 
-TEST(ColorModel, SmallerTimestepApproachesFineReference){
-    const float fine = simulateRamp(0.01f, 60.0f);
-    const float mid = simulateRamp(0.1f, 60.0f);
-    const float coarse = simulateRamp(1.0f, 60.0f);
-    EXPECT_GT(std::abs(coarse - fine), 1e-3f);
-    EXPECT_LT(std::abs(mid - fine), std::abs(coarse - fine));
+TEST(ColorModel, CookedLabGoesFromRedToBrown){
+    const glm::vec3 raw{52.8f, 41.2f, 27.0f};
+    const ColorReference reference{labLuminance(raw), raw.y};
+    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius, reference), raw);
+    EXPECT_EQ(cookedLab(raw, 30.0f, reference), raw);
+
+    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f), reference);
+    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f), reference);
+    const glm::vec3 crust = cookedLab(raw, 170.0f, reference);
+    EXPECT_LT(rare.y, raw.y);
+    EXPECT_LT(wellDone.y, rare.y - 10.0f);
+    EXPECT_GT(wellDone.x, rare.x);
+    EXPECT_LT(crust.x, wellDone.x);
+    EXPECT_LT(crust.y, wellDone.y);
+    // A texel as bright as the reference takes the table color exactly.
+    EXPECT_LT(channelError(crust, kDonenessKeys[kDonenessKeyCount - 1].lab), 0.05f);
+}
+
+TEST(ColorModel, CookedColorKeepsTextureLightness){
+    const glm::vec3 meat{52.8f, 41.2f, 27.0f};
+    const glm::vec3 fat{85.0f, 4.0f, 15.0f};
+    const ColorReference reference{labLuminance(meat), meat.y};
+    const glm::vec3 meatCrust = cookedLab(meat, 170.0f, reference);
+    const glm::vec3 fatCrust = cookedLab(fat, 170.0f, reference);
+    const glm::vec3 darkCrust = cookedLab({40.0f, 35.0f, 25.0f}, 170.0f, reference);
+    EXPECT_GT(fatCrust.x, meatCrust.x + 5.0f);
+    EXPECT_LT(fatCrust.x, fat.x);
+    EXPECT_LT(darkCrust.x, meatCrust.x);
+    // Scaling linear RGB keeps the table's hue: fat browns instead of staying white.
+    EXPECT_GT(fatCrust.y, 5.0f);
+    EXPECT_GT(fatCrust.z, 10.0f);
+}
+
+TEST(ColorModel, FatBrownsButDoesNotRedden){
+    const glm::vec3 meat{52.8f, 41.2f, 27.0f};
+    const glm::vec3 fat{85.0f, 4.0f, 15.0f};
+    const glm::vec3 marbling{75.0f, 15.0f, 18.0f};
+    const ColorReference reference{labLuminance(meat), meat.y};
+    EXPECT_EQ(meatiness(meat.y, reference.redness), 1.0f);
+    EXPECT_EQ(meatiness(fat.y, reference.redness), 0.0f);
+    EXPECT_GT(meatiness(marbling.y, reference.redness), 0.0f);
+    EXPECT_LT(meatiness(marbling.y, reference.redness), 1.0f);
+    EXPECT_EQ(meatiness(fat.y, 0.0f), 1.0f);
+
+    // Center temperatures never redden fat and only tint marbling. Fat is untouched until it starts to
+    // render, then follows the fat table.
+    EXPECT_EQ(cookedLab(fat, kFatKeys[0].celsius, reference), fat);
+    for (float celsius : {49.0f, 55.0f, 65.0f, 71.0f}){
+        EXPECT_LE(cookedLab(fat, celsius, reference).y, 12.0f) << celsius;
+        EXPECT_GT(cookedLab(marbling, celsius, reference).x, cookedLab(meat, celsius, reference).x) << celsius;
+    }
+    // Below the browning range, a fat texel sits exactly at its blend toward each fat key.
+    for (int k = 1; k < kFatKeyCount && kFatKeys[k].celsius <= kBrowningStartCelsius; ++k){
+        const DonenessKey& key = kFatKeys[k];
+        EXPECT_LT(channelError(cookedLab(fat, key.celsius, reference), fat + (key.lab - fat) * key.strength), 1e-4f) << key.celsius;
+    }
+    const glm::vec3 half = cookedLab(fat, 0.5f * (kFatKeys[0].celsius + kFatKeys[1].celsius), reference);
+    EXPECT_GT(half.z, fat.z);
+    EXPECT_LT(half.z, cookedLab(fat, kFatKeys[1].celsius, reference).z);
+    EXPECT_EQ(kFatKeys[0].lab, kFatKeys[1].lab);
+    // Part way to crust temperatures fat starts to brown; at crust it browns fully.
+    EXPECT_LT(cookedLab(fat, 110.0f, reference).x, fat.x - 5.0f);
+    EXPECT_GT(cookedLab(fat, 110.0f, reference).x, cookedLab(fat, kBrowningFullCelsius, reference).x);
+    const glm::vec3 crust = cookedLab(fat, 170.0f, reference);
+    EXPECT_LT(crust.x, 60.0f);
+    EXPECT_GT(crust.y, 5.0f);
+
+    // The browning range starts at the well-done center key and ends at the first crust key.
+    EXPECT_FLOAT_EQ(kBrowningStartCelsius, kDonenessKeys[kDonenessKeyCount - 3].celsius);
+    EXPECT_FLOAT_EQ(kBrowningFullCelsius, kDonenessKeys[kDonenessKeyCount - 2].celsius);
+}
+
+TEST(ColorModel, PeakOnlyRises){
+    float peak = kNoPeakCelsius;
+    for (float fahrenheit : {70.0f, 150.0f, 300.0f, 200.0f, 90.0f}) peak = raisePeak(peak, fahrenheit);
+    EXPECT_FLOAT_EQ(peak, fahrenheitToCelsius(300.0f));
+    EXPECT_FLOAT_EQ(raisePeak(peak, std::nanf("")), peak);
 }
 
 std::vector<uint8_t> texel(uint8_t r, uint8_t g, uint8_t b){
@@ -135,13 +201,16 @@ TEST(ColorSolver, InitMatchesTextureLab){
     EXPECT_NEAR(solver.linearRgb()[4].x, 0.0f, 1e-3f);
 }
 
-TEST(ColorSolver, GpuKineticsMatchesCpu){
+TEST(ColorSolver, GpuColorMatchesCpu){
     REQUIRE_VULKAN();
     const std::vector<uint8_t> image = texel(255, 0, 0);
     const glm::uvec3 dims{2, 1, 1};
     const std::vector<uint32_t> cells{CELL_SOLID, CELL_AIR};
     const std::vector<glm::vec2> uv{{0.25f, 0.25f}, {0.25f, 0.25f}};
-    const std::vector<float> schedule{70.0f, 120.0f, 180.0f, 250.0f, 320.0f};
+    // Heats to 320 F (160 C), then cools; the color must keep the peak.
+    std::vector<float> schedule;
+    for (int i = 0; i < 100; ++i) schedule.push_back(70.0f + 250.0f * static_cast<float>(i) / 99.0f);
+    for (int i = 1; i <= 50; ++i) schedule.push_back(320.0f - 220.0f * static_cast<float>(i) / 50.0f);
     constexpr float dt = 2.0f;
 
     ColorSolver initial = makeSolver();
@@ -155,12 +224,19 @@ TEST(ColorSolver, GpuKineticsMatchesCpu){
     solved.prepareGrid(dims, cells, uv, image.data(), 2, 2, dt);
     solved.runExplicitTemperatures(fields);
 
-    float a = lab0.y;
-    for (float temperature : schedule) a = stepLabA(a, lab0.y, temperature, dt);
-    EXPECT_NEAR(solved.lab()[0].x, lab0.x, 0.08f);
-    EXPECT_NEAR(solved.lab()[0].z, lab0.z, 0.08f);
-    EXPECT_NEAR(solved.lab()[0].y, a, 0.25f);
-    EXPECT_LT(solved.lab()[0].y, lab0.y - 0.5f);
+    float peak = kNoPeakCelsius;
+    for (float temperature : schedule) peak = raisePeak(peak, temperature);
+    EXPECT_GT(solved.reference().luminance, 0.0f);
+    EXPECT_NEAR(solved.reference().redness, lab0.y, 0.5f);
+    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak, solved.reference());
+    EXPECT_NEAR(solved.lab()[0].x, expected.x, 0.25f);
+    EXPECT_NEAR(solved.lab()[0].y, expected.y, 0.25f);
+    EXPECT_NEAR(solved.lab()[0].z, expected.z, 0.25f);
+    EXPECT_LT(solved.lab()[0].x, lab0.x - 10.0f);
+    EXPECT_LT(solved.lab()[0].y, 20.0f);
+    ASSERT_EQ(solved.peakCelsius().size(), 2u);
+    EXPECT_NEAR(solved.peakCelsius()[0], peak, 1e-3f);
+    EXPECT_EQ(solved.peakCelsius()[1], kNoPeakCelsius);
     EXPECT_NEAR(solved.lab()[1].w, 0.0f, 1e-3f);
     EXPECT_NEAR(glm::length(solved.linearRgb()[1]), 0.0f, 1e-3f);
 }

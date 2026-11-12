@@ -24,7 +24,7 @@ add_custom_command(
           -target spirv -profile spirv_1_4 -emit-spirv-directly
           -fvk-use-entrypoint-name -entry vertMain -entry fragMain
           -o ${COLOR_SHADER_SPV}
-  DEPENDS ${COLOR_SHADER_SRC} ${COMPUTE_SHADER_DIR}/lab_color.slang
+  DEPENDS ${COLOR_SHADER_SRC} ${COMPUTE_SHADER_DIR}/lab_color.slang ${COMPUTE_SHADER_DIR}/doneness.slang
   COMMENT "Compiling steak color mesh shader"
   VERBATIM)
 add_custom_target(steak_color_shaders DEPENDS ${COLOR_SHADER_SPV})

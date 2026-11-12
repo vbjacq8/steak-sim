@@ -14,6 +14,7 @@ C++20 + Vulkan project. No databases or external services.
 | `src/render/heat_view.cpp` | `steak_heat_view` library: Open3D heat-map window shared by the heat executables |
 | `src/render/heat_viewer.cpp` | `heat_viewer`: heat sim on a solid block, shown in the heat-map window |
 | `src/render/steak_heat_demo.cpp` | `steak_heat_demo`: voxel heat and cooked color; toggles the temperature map, that texture, and the textured mesh |
+| `src/tools/doneness_calibrate.cpp` | `doneness_calibrate`: headless; cooks a flipped 1D column to a center temperature and prints each layer's peak, for calibrating the doneness table |
 | `src/shaders/{render,compute}/` | Slang shaders, compiled by `slangc` |
 | `tests/` | `voxel_tests` and `heat_tests` (GoogleTest) plus `voxel_tests.slang` |
 

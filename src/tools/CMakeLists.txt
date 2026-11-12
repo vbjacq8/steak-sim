@@ -1,0 +1,2 @@
+add_executable(doneness_calibrate doneness_calibrate.cpp)
+target_link_libraries(doneness_calibrate PRIVATE steak_voxelizer)

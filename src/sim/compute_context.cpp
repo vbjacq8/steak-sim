@@ -5,6 +5,7 @@
 #include <vector>
 
 ComputeContext::ComputeContext(const char* appName){
+    //set up the compute context by querying available resources and initializing raii pointers to those resources
     std::vector<const char*> instanceExtensions;
     vk::InstanceCreateFlags instanceFlags{};
     for (const auto& extension : context.enumerateInstanceExtensionProperties()){

@@ -11,7 +11,6 @@
 #include "reset_dialog.hpp"
 #include "voxelizer.hpp"
 
-#include <queue>
 
 #include <open3d/Open3D.h>
 #include <open3d/visualization/rendering/ColorGrading.h>
@@ -105,7 +104,7 @@ std::shared_ptr<gui::ImageWidget> makeSwatch(const Eigen::Vector3d& color, int w
 }
 
 void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, glm::uvec3 cell, int axis, bool positive,
-                float coldTemp, float hotTemp, bool showCookedColor){
+                float coldTemp, float hotTemp, bool showCookedColor, bool showInitialColor){
     const int u = (axis + 1) % 3;
     const int v = (axis + 2) % 3;
     const double s = grid.spacing * MM_PER_M;
@@ -119,12 +118,14 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
     const std::array<std::array<double, 2>, 4> corners{{{lo[u], lo[v]}, {hi[u], lo[v]}, {hi[u], hi[v]}, {lo[u], hi[v]}}};
 
     const int base = static_cast<int>(blocks.vertices_.size());
-    const bool meat = showCookedColor && grid.color.size() == grid.cellCount() && grid.kind(cell.x, cell.y, cell.z) == CELL_SOLID;
+    const bool solid = grid.kind(cell.x, cell.y, cell.z) == CELL_SOLID;
+    const bool initial = showInitialColor && solid && grid.initialColor.size() == grid.cellCount();
+    const bool meat = !initial && showCookedColor && solid && grid.color.size() == grid.cellCount();
     Eigen::Vector3d color;
-    if (meat){
+    if (initial || meat){
         // Already linear sRGB from the Lab export. The heat-map stops are display values and get
         // linearized with pow(2.2); doing that again would darken the steak.
-        const glm::vec3 sample = grid.color[grid.index(cell.x, cell.y, cell.z)];
+        const glm::vec3 sample = (initial ? grid.initialColor : grid.color)[grid.index(cell.x, cell.y, cell.z)];
         auto channel = [](float value){ return std::isfinite(value) ? std::clamp(value, 0.0f, 1.0f) : 0.0f; };
         color = {channel(sample.x), channel(sample.y), channel(sample.z)};
     } else{
@@ -151,7 +152,8 @@ void appendFace(open3d::geometry::TriangleMesh& blocks, const HeatGrid& grid, gl
 // Builds the block mesh for the current slice. Safe to call off the UI thread. `progress` is the fraction of
 // z-slices finished.
 open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis, int slice, bool showPan, float coldTemp,
-                                             float hotTemp, bool showCookedColor, const std::function<void(float)>& progress){
+                                             float hotTemp, bool showCookedColor, bool showInitialColor,
+                                             const std::function<void(float)>& progress){
     glm::uvec3 regionLo(0);
     glm::uvec3 regionHi = grid.dims - 1u;
     if (slice >= 0){
@@ -178,7 +180,9 @@ open3d::geometry::TriangleMesh buildHeatMesh(const HeatGrid& grid, int sliceAxis
                     for (int side : {-1, 1}){
                         glm::ivec3 neighbor = cell;
                         neighbor[axis] += side;
-                        if (!drawn(neighbor)) appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp, showCookedColor);
+                        if (!drawn(neighbor)){
+                            appendFace(blocks, grid, glm::uvec3(cell), axis, side > 0, coldTemp, hotTemp, showCookedColor, showInitialColor);
+                        }
                     }
                 }
             }
@@ -195,6 +199,7 @@ bool hasSurface(const HeatSurface& surface){
 struct GridFrame{
     glm::vec3 origin{};
     float voxelSize = 1.0f;
+    float midZ = 0.0f;  // model-space height halfway up the mesh; splits the pan side from the top
 };
 
 // Same corner the voxelizer uses, so a model-space point lands in the cell the blocks draw for that index.
@@ -206,7 +211,7 @@ GridFrame gridFrame(const HeatGrid& grid, const HeatSurface& surface){
         high = glm::max(high, point);
     }
     const VoxelGrid layout = makeVoxelGridLayout(low, high, grid.spacing / surface.metersPerUnit);
-    return {layout.origin, layout.voxelSize};
+    return {layout.origin, layout.voxelSize, 0.5f * (low.z + high.z)};
 }
 
 Eigen::Vector3d sampleVoxel(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position, float coldTemp, float hotTemp,
@@ -269,14 +274,22 @@ bool hasAlbedo(const HeatSurface& surface){
            surface.texcoords.size() == surface.positions.size();
 }
 
+// Meshes often map their top and bottom faces onto the same texels, so one texture could not cook the
+// pan side differently from the top. The drawn albedo holds two copies side by side: the left page for
+// triangles above GridFrame::midZ, the right page for those below it.
+constexpr int kAlbedoPages = 2;
+
+bool belowMid(const GridFrame& frame, float z){ return z < frame.midZ; }
+
 std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
     if (!hasAlbedo(surface)) return nullptr;
     auto image = std::make_shared<open3d::geometry::Image>();
-    image->Prepare(surface.width, surface.height, 3, 1);
+    const int width = surface.width * kAlbedoPages;
+    image->Prepare(width, surface.height, 3, 1);
     for (int y = 0; y < surface.height; ++y){
-        for (int x = 0; x < surface.width; ++x){
-            const size_t src = (static_cast<size_t>(y) * surface.width + x) * 4;
-            const size_t dst = (static_cast<size_t>(y) * surface.width + x) * 3;
+        for (int x = 0; x < width; ++x){
+            const size_t src = (static_cast<size_t>(y) * surface.width + x % surface.width) * 4;
+            const size_t dst = (static_cast<size_t>(y) * width + x) * 3;
             image->data_[dst] = surface.rgba[src];
             image->data_[dst + 1] = surface.rgba[src + 1];
             image->data_[dst + 2] = surface.rgba[src + 2];
@@ -285,86 +298,124 @@ std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
     return image;
 }
 
-bool isSurfaceCell(const HeatGrid& grid, int x, int y, int z){
-    if (grid.kind(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)) != CELL_SOLID) return false;
-    const int offset[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    for (const auto& step : offset){
-        const int nx = x + step[0];
-        const int ny = y + step[1];
-        const int nz = z + step[2];
-        if (nx < 0 || ny < 0 || nz < 0 || nx >= static_cast<int>(grid.dims.x) || ny >= static_cast<int>(grid.dims.y) ||
-            nz >= static_cast<int>(grid.dims.z) ||
-            grid.kind(static_cast<uint32_t>(nx), static_cast<uint32_t>(ny), static_cast<uint32_t>(nz)) != CELL_SOLID){
-            return true;
+// Peak temperature at a model-space point, trilinear over the solid cells around it. Cells that are not
+// meat get no weight, so a point on the surface takes the outermost meat layer's value.
+float samplePeak(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position){
+    const glm::vec3 coord = (position - frame.origin) / frame.voxelSize - 0.5f;
+    const glm::ivec3 base(glm::floor(coord));
+    const glm::vec3 t = coord - glm::vec3(base);
+    const auto solidAt = [&](glm::ivec3 c){
+        return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < static_cast<int>(grid.dims.x) && c.y < static_cast<int>(grid.dims.y) &&
+               c.z < static_cast<int>(grid.dims.z) &&
+               grid.kind(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y), static_cast<uint32_t>(c.z)) == CELL_SOLID;
+    };
+    const auto peakAt = [&](glm::ivec3 c){
+        return grid.peakCelsius[grid.index(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y), static_cast<uint32_t>(c.z))];
+    };
+    float weight = 0.0f;
+    float sum = 0.0f;
+    for (int corner = 0; corner < 8; ++corner){
+        const glm::ivec3 offset((corner & 1) ? 1 : 0, (corner & 2) ? 1 : 0, (corner & 4) ? 1 : 0);
+        if (!solidAt(base + offset)) continue;
+        const float w = (offset.x ? t.x : 1.0f - t.x) * (offset.y ? t.y : 1.0f - t.y) * (offset.z ? t.z : 1.0f - t.z);
+        weight += w;
+        sum += w * peakAt(base + offset);
+    }
+    if (weight > 1.0e-6f) return sum / weight;
+    // Mesh and voxels disagree by up to a cell at thin spots; take the nearest meat within one cell.
+    const glm::ivec3 nearest(glm::round(coord));
+    float best = std::numeric_limits<float>::max();
+    float peak = kNoPeakCelsius;
+    for (int dz = -1; dz <= 1; ++dz){
+        for (int dy = -1; dy <= 1; ++dy){
+            for (int dx = -1; dx <= 1; ++dx){
+                const glm::ivec3 c = nearest + glm::ivec3(dx, dy, dz);
+                if (!solidAt(c)) continue;
+                const float distance = glm::length(glm::vec3(c) - coord);
+                if (distance < best){
+                    best = distance;
+                    peak = peakAt(c);
+                }
+            }
         }
     }
-    return false;
+    return peak;
 }
 
-// Photo-resolution cook. Each surface voxel contributes its cooked a* at the texel it sampled.
-// L* and b* stay the albedo's, so marbling is not smeared across triangles.
+// Photo-resolution cook. Every triangle is rasterized into its albedo page; each covered texel finds its
+// model-space point, samples the peak temperature there, and is cooked from its own Lab with the same
+// doneness table as the voxels. The texture keeps its own detail, and the cook varies smoothly instead
+// of in voxel-sized blocks.
 std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, const HeatSurface& surface){
     auto image = makeAlbedo(surface);
-    if (!image || grid.color.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
-    const int width = surface.width;
+    if (!image || grid.peakCelsius.size() != grid.cellCount()) return image;
+    const GridFrame frame = gridFrame(grid, surface);
+    const int pageWidth = surface.width;
+    const int width = pageWidth * kAlbedoPages;
     const int height = surface.height;
-    const size_t texels = static_cast<size_t>(width) * height;
-    std::vector<float> aSum(texels, 0.0f);
-    std::vector<float> aWeight(texels, 0.0f);
-    for (int z = 0; z < static_cast<int>(grid.dims.z); ++z){
-        for (int y = 0; y < static_cast<int>(grid.dims.y); ++y){
-            for (int x = 0; x < static_cast<int>(grid.dims.x); ++x){
-                if (!isSurfaceCell(grid, x, y, z)) continue;
-                const glm::vec2 uv = grid.sampleUv[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
-                if (uv.x < 0.0f || uv.y < 0.0f || uv.x > 1.0f || uv.y > 1.0f) continue;
-                const int px = std::clamp(static_cast<int>(std::lround(uv.x * (width - 1))), 0, width - 1);
-                const int py = std::clamp(static_cast<int>(std::lround(uv.y * (height - 1))), 0, height - 1);
-                const size_t texel = static_cast<size_t>(py) * width + px;
-                aSum[texel] += linearSrgbToLab(grid.color[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))]).y;
-                aWeight[texel] += 1.0f;
+    std::vector<float> peak(static_cast<size_t>(width) * height, std::numeric_limits<float>::quiet_NaN());
+
+    for (size_t t = 0; t + 2 < surface.indices.size(); t += 3){
+        const uint32_t ids[3] = {surface.indices[t], surface.indices[t + 1], surface.indices[t + 2]};
+        if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
+        const glm::vec3 p[3] = {surface.positions[ids[0]], surface.positions[ids[1]], surface.positions[ids[2]]};
+        const int page = belowMid(frame, (p[0].z + p[1].z + p[2].z) / 3.0f) ? 1 : 0;
+        // Display UVs are V up; image rows run top first.
+        glm::vec2 q[3];
+        for (int c = 0; c < 3; ++c){
+            const glm::vec2 uv = surface.texcoords[ids[c]];
+            q[c] = {(uv.x + static_cast<float>(page)) * static_cast<float>(pageWidth), (1.0f - uv.y) * static_cast<float>(height)};
+        }
+        const float area = (q[1].x - q[0].x) * (q[2].y - q[0].y) - (q[2].x - q[0].x) * (q[1].y - q[0].y);
+        if (!(std::abs(area) > 1.0e-8f)) continue;
+        const int x0 = std::max(static_cast<int>(std::floor(std::min({q[0].x, q[1].x, q[2].x}))), page * pageWidth);
+        const int x1 = std::min(static_cast<int>(std::ceil(std::max({q[0].x, q[1].x, q[2].x}))), (page + 1) * pageWidth - 1);
+        const int y0 = std::max(static_cast<int>(std::floor(std::min({q[0].y, q[1].y, q[2].y}))), 0);
+        const int y1 = std::min(static_cast<int>(std::ceil(std::max({q[0].y, q[1].y, q[2].y}))), height - 1);
+        for (int y = y0; y <= y1; ++y){
+            for (int x = x0; x <= x1; ++x){
+                const glm::vec2 c(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+                const float b1 = ((c.x - q[0].x) * (q[2].y - q[0].y) - (q[2].x - q[0].x) * (c.y - q[0].y)) / area;
+                const float b2 = ((q[1].x - q[0].x) * (c.y - q[0].y) - (c.x - q[0].x) * (q[1].y - q[0].y)) / area;
+                const float b0 = 1.0f - b1 - b2;
+                constexpr float kEdge = -1.0e-4f;
+                if (b0 < kEdge || b1 < kEdge || b2 < kEdge) continue;
+                peak[static_cast<size_t>(y) * width + x] = samplePeak(grid, frame, b0 * p[0] + b1 * p[1] + b2 * p[2]);
             }
         }
     }
 
-    constexpr int kMaxSpread = 64;
-    std::vector<int> distance(texels, kMaxSpread + 1);
-    std::vector<float> cookedA(texels, 0.0f);
-    std::queue<std::pair<int, int>> wave;
-    for (int y = 0; y < height; ++y){
-        for (int x = 0; x < width; ++x){
-            const size_t texel = static_cast<size_t>(y) * width + x;
-            if (!(aWeight[texel] > 0.0f)) continue;
-            distance[texel] = 0;
-            cookedA[texel] = aSum[texel] / aWeight[texel];
-            wave.emplace(x, y);
+    // Grow each island by a few texels so bilinear filtering at its edges does not pull in raw texels.
+    constexpr int kBleed = 3;
+    for (int pass = 0; pass < kBleed; ++pass){
+        std::vector<float> grown = peak;
+        for (int y = 0; y < height; ++y){
+            for (int x = 0; x < width; ++x){
+                const size_t texel = static_cast<size_t>(y) * width + x;
+                if (!std::isnan(peak[texel])) continue;
+                const int neighbor[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (const auto& step : neighbor){
+                    const int nx = x + step[0];
+                    const int ny = y + step[1];
+                    if (nx < 0 || ny < 0 || nx >= width || ny >= height || nx / pageWidth != x / pageWidth) continue;
+                    const float value = peak[static_cast<size_t>(ny) * width + nx];
+                    if (!std::isnan(value)){
+                        grown[texel] = value;
+                        break;
+                    }
+                }
+            }
         }
-    }
-    while (!wave.empty()){
-        const auto [x, y] = wave.front();
-        wave.pop();
-        const size_t texel = static_cast<size_t>(y) * width + x;
-        const int next = distance[texel] + 1;
-        if (next > kMaxSpread) continue;
-        const int neighbor[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-        for (const auto& step : neighbor){
-            const int nx = x + step[0];
-            const int ny = y + step[1];
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-            const size_t nextTexel = static_cast<size_t>(ny) * width + nx;
-            if (distance[nextTexel] <= next) continue;
-            distance[nextTexel] = next;
-            cookedA[nextTexel] = cookedA[texel];
-            wave.emplace(nx, ny);
-        }
+        peak.swap(grown);
     }
 
-    for (size_t texel = 0; texel < texels; ++texel){
-        if (distance[texel] > kMaxSpread) continue;
+    const ColorReference reference{grid.colorReferenceY, grid.colorReferenceA};
+    for (size_t texel = 0; texel < peak.size(); ++texel){
+        if (std::isnan(peak[texel])) continue;
         const size_t byte = texel * 3;
         const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
-        glm::vec3 lab = linearSrgbToLab(srgbToLinear(encoded));
-        lab.y = cookedA[texel];
-        const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
+        const glm::vec3 lab0 = linearSrgbToLab(srgbToLinear(encoded));
+        const glm::vec3 out = linearToSrgb(labToLinearSrgb(cookedLab(lab0, peak[texel], reference)));
         image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
         image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));
         image->data_[byte + 2] = static_cast<uint8_t>(std::lround(out.z * 255.0f));
@@ -395,6 +446,9 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
         if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
         if (!inSlice(surface.positions[ids[0]]) && !inSlice(surface.positions[ids[1]]) && !inSlice(surface.positions[ids[2]])) continue;
         Eigen::Vector3i triangle;
+        const float centroidZ =
+            (surface.positions[ids[0]].z + surface.positions[ids[1]].z + surface.positions[ids[2]].z) / 3.0f;
+        const float page = belowMid(frame, centroidZ) ? 1.0f : 0.0f;
         for (int corner = 0; corner < 3; ++corner){
             int& slot = remap[ids[corner]];
             if (slot < 0){
@@ -407,7 +461,7 @@ open3d::geometry::TriangleMesh buildSurfaceMesh(const HeatGrid& grid, const Heat
             triangle[corner] = slot;
             if (textured){
                 const glm::vec2 uv = surface.texcoords[ids[corner]];
-                mesh.triangle_uvs_.emplace_back(uv.x, uv.y);
+                mesh.triangle_uvs_.emplace_back((uv.x + page) / kAlbedoPages, uv.y);
             }
         }
         mesh.triangles_.push_back(triangle);
@@ -511,7 +565,7 @@ private:
     void rebuildView(){
         if (resetting) return;
         if (showVolume || !hasSurface(surface)){
-            blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, {});
+            blocks = buildHeatMesh(grid, sliceAxis, slice, showPan, coldTemp, hotTemp, showCookedColor, showInitialColor, {});
         } else{
             surfaceDraw = buildSurfaceMesh(grid, surface, sliceAxis, slice, coldTemp, hotTemp, showCookedColor);
         }
@@ -563,7 +617,24 @@ private:
     void setShowCookedColor(bool show){
         if (grid.color.size() != grid.cellCount() || showCookedColor == show) return;
         showCookedColor = show;
+        if (show && showInitialColor){
+            showInitialColor = false;
+            if (initialCheckbox) initialCheckbox->SetChecked(false);
+        }
         if (colorCheckbox) colorCheckbox->SetChecked(show);
+        rebuildView();
+    }
+
+    void setShowInitialColor(bool show){
+        if (grid.initialColor.size() != grid.cellCount() || showInitialColor == show) return;
+        showInitialColor = show;
+        if (show){
+            showCookedColor = false;
+            showVolume = true;
+            if (colorCheckbox) colorCheckbox->SetChecked(false);
+            if (volumeCheckbox) volumeCheckbox->SetChecked(true);
+        }
+        if (initialCheckbox) initialCheckbox->SetChecked(show);
         rebuildView();
     }
 
@@ -715,6 +786,10 @@ private:
             colorCheckbox->SetChecked(showCookedColor);
             colorCheckbox->SetOnChecked([this](bool checked){ setShowCookedColor(checked); });
             viewBody.AddChild(colorCheckbox);
+            initialCheckbox = std::make_shared<gui::Checkbox>("Initial texture");
+            initialCheckbox->SetChecked(showInitialColor);
+            initialCheckbox->SetOnChecked([this](bool checked){ setShowInitialColor(checked); });
+            viewBody.AddChild(initialCheckbox);
         }
         if (hasSurface(surface)){
             volumeCheckbox = std::make_shared<gui::Checkbox>("Voxel volume");
@@ -867,7 +942,10 @@ private:
         scroll->AddChild(meat);
 
         std::string helpText = "Drag to rotate, scroll to zoom\n Press 'X', 'Y', 'Z' to take slices along axes and move them with the arrow keys\n Press 'A' to toggle back to the full domain. \n Press 'P' to toggle pan.";
-        if (grid.color.size() == grid.cellCount()) helpText += "\n Press 'C' to toggle cooked color.";
+        if (grid.color.size() == grid.cellCount()){
+            helpText += "\n Press 'C' to toggle cooked color.";
+            helpText += "\n Press 'I' for the voxel volume of the texture before cooking.";
+        }
         if (hasSurface(surface)) helpText += "\n Press 'V' to toggle the voxel volume and the mesh.";
         auto help = std::make_shared<gui::Label>(helpText.c_str());
         help->SetTextColor(gui::Color(0.7f, 0.7f, 0.7f));
@@ -911,11 +989,12 @@ private:
         const int sliceNow = slice;
         const bool pan = showPan;
         const bool cooked = showCookedColor;
+        const bool initial = showInitialColor;
         const float cold = coldTemp;
         const float hot = hotTemp;
         auto dialog = progressDialog;
         auto simulator = simulate;
-        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cooked, cold, hot, simulator](){
+        gui::Application::GetInstance().RunInThread([this, dialog, ran, ranSteps, axis, sliceNow, pan, cooked, initial, cold, hot, simulator](){
             int lastPercent = -1;
             auto report = [this, dialog, &lastPercent](float fraction){
                 const int percent = std::clamp(static_cast<int>(std::lround(fraction * 100.0f)), 0, 100);
@@ -927,7 +1006,7 @@ private:
                 report(0.01f);
                 HeatGrid next = simulator(ran, ranSteps, [&](float fraction){ report(0.02f + 0.78f * fraction); });
                 auto mesh = std::make_shared<open3d::geometry::TriangleMesh>(
-                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, cooked, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
+                    buildHeatMesh(next, axis, sliceNow, pan, cold, hot, cooked, initial, [&](float fraction){ report(0.80f + 0.19f * fraction); }));
                 auto gridPtr = std::make_shared<HeatGrid>(std::move(next));
                 auto applied = std::make_shared<HeatParams>(ran);
                 gui::Application::GetInstance().PostToMainThread(
@@ -1003,6 +1082,7 @@ private:
             case gui::KEY_A: setSlice(-1); return true;
             case gui::KEY_P: setShowPan(!showPan); return true;
             case gui::KEY_C: setShowCookedColor(!showCookedColor); return true;
+            case gui::KEY_I: setShowInitialColor(!showInitialColor); return true;
             case gui::KEY_V: setShowVolume(!showVolume); return true;
             default: return false;
         }
@@ -1022,6 +1102,7 @@ private:
     int slice = -1;
     bool showPan = true;
     bool showCookedColor = false;
+    bool showInitialColor = false;
     bool showVolume = true;
     bool resetting = false;
     bool progressArmed = false;
@@ -1038,6 +1119,7 @@ private:
     std::array<std::shared_ptr<gui::Label>, LEGEND_ROWS> legendLabels;
     std::shared_ptr<gui::Checkbox> panCheckbox;
     std::shared_ptr<gui::Checkbox> colorCheckbox;
+    std::shared_ptr<gui::Checkbox> initialCheckbox;
     std::shared_ptr<gui::Checkbox> volumeCheckbox;
     std::shared_ptr<gui::Label> axisLabel;
     std::shared_ptr<gui::Combobox> axisCombo;

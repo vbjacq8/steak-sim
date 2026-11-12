@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.29)
-project(steak-sim LANGUAGES CXX)
+project(steak-sim LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,24 +23,23 @@ FetchContent_Declare(tinyobjloader
   GIT_TAG v2.0.0rc13
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR none)
-FetchContent_Declare(tinygltf
-  GIT_REPOSITORY https://github.com/syoyo/tinygltf.git
-  GIT_TAG v2.9.7
-  GIT_SHALLOW TRUE
-  SOURCE_SUBDIR none)
 FetchContent_Declare(stb
   GIT_REPOSITORY https://github.com/nothings/stb.git
   GIT_TAG master
   GIT_SHALLOW TRUE
   SOURCE_SUBDIR none)
-FetchContent_MakeAvailable(glm tinyobjloader tinygltf stb)
+FetchContent_MakeAvailable(glm tinyobjloader stb)
 
 add_library(steak_third_party INTERFACE)
 target_include_directories(steak_third_party INTERFACE
   ${glm_SOURCE_DIR}
   ${tinyobjloader_SOURCE_DIR}
-  ${tinygltf_SOURCE_DIR}
   ${stb_SOURCE_DIR})
+
+# tinygltf v3 is vendored in include/. FS lets tg3_parse_file read the file and its external buffers.
+add_library(tinygltf3 STATIC include/tiny_gltf_v3.c)
+target_include_directories(tinygltf3 PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(tinygltf3 PRIVATE TINYGLTF3_ENABLE_FS)
 
 # Every executable lands directly in the build directory; compiled shaders go in build/shaders.
 # Executables get absolute shader/asset paths at compile time, so they run from any directory.
@@ -55,6 +54,7 @@ set(RENDER_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/render)
 set(COMPUTE_SHADER_DIR ${CMAKE_SOURCE_DIR}/src/shaders/compute)
 
 add_subdirectory(src/sim)
+add_subdirectory(src/tools)
 
 if(STEAK_BUILD_RENDER)
   add_subdirectory(src/render)
