@@ -49,6 +49,8 @@ public:
     const std::vector<glm::vec3>& initialLinearRgb() const { return initialRgbValues; }
     // Hottest temperature each cell reached, Celsius; kNoPeakCelsius where no step ran or the cell is not solid.
     const std::vector<float>& peakCelsius() const { return peakValues; }
+    // Median luminance (CIE Y) of the texels the solid cells sample; cookedLab's referenceY.
+    float referenceLuminance() const { return referenceY; }
 
 private:
     struct GpuImage{
@@ -104,6 +106,7 @@ private:
 
     glm::uvec3 dims{};
     float dt = 1.0f;
+    float referenceY = 0.0f;
     uint32_t completedSteps = 0;
     std::vector<glm::vec4> labValues;
     std::vector<glm::vec3> rgbValues;

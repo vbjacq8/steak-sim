@@ -128,10 +128,24 @@ inline Doneness donenessAt(float peakCelsius){
     return d;
 }
 
-// Lab of a texel with raw Lab `lab0` once its cell has peaked at `peakCelsius`.
-inline glm::vec3 cookedLab(glm::vec3 lab0, float peakCelsius){
+// How much of the texture's light/dark pattern survives cooking. The cooked color is the table color
+// scaled, in linear RGB, by (texel luminance / reference luminance)^kTextureDetail, so a texel as
+// bright as the reference gets the table color, fat comes out lighter and marbling stays faintly
+// visible. 0 flattens everything to the table color; 1 keeps the full lightness pattern.
+inline constexpr float kTextureDetail = 0.5f;
+
+// CIE Y of a Lab color, on the same white as linearSrgbToLab.
+inline float labLuminance(glm::vec3 lab){ return labWhiteY() * labFInv((lab.x + 16.0f) / 116.0f); }
+
+// Lab of a texel with raw Lab `lab0` once its cell has peaked at `peakCelsius`. The doneness strength
+// is the cooked fraction: 0 keeps the texel, 1 gives the cooked color. `referenceY` is the luminance of
+// the texture's typical meat (ColorSolver::referenceLuminance).
+inline glm::vec3 cookedLab(glm::vec3 lab0, float peakCelsius, float referenceY){
     const Doneness d = donenessAt(peakCelsius);
-    return lab0 + (d.lab - lab0) * d.strength;
+    if (!(d.strength > 0.0f)) return lab0;
+    const float detail = std::pow(std::max(labLuminance(lab0), 0.0f) / std::max(referenceY, 1.0e-4f), kTextureDetail);
+    const glm::vec3 cooked = linearSrgbToLab(glm::clamp(labToLinearSrgb(d.lab) * detail, 0.0f, 1.0f));
+    return lab0 + (cooked - lab0) * d.strength;
 }
 
 // Peak update after a heat step. `fahrenheit` is the heat-solver temperature; NaN keeps the peak.

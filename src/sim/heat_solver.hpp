@@ -63,6 +63,8 @@ struct HeatGrid{
     // Hottest temperature each cell reached, Celsius (kNoPeakCelsius in color_model.hpp where none). Lets
     // the viewer cook the full-resolution albedo the same way. Empty when color is not run; same indexing.
     std::vector<float> peakCelsius;
+    // Luminance of the albedo's typical meat, the referenceY that cooked the color. 0 when color is not run.
+    float colorReferenceY = 0.0f;
     // UV that seeded each cell from the albedo. (-1, -1) when the cell has none. Empty if color
     // was not run. Same indexing as color.
     std::vector<glm::vec2> sampleUv;

@@ -13,7 +13,7 @@ static const uint CELL_SOLID = 1u; // must match heat_solver.hpp
 
 struct ColorPush {
     uint3 dims;
-    float dt; // unused here; present so every color pass shares one push-constant layout
+    float referenceY; // unused here; present so every color pass shares one push-constant layout
 };
 
 [[vk::push_constant]]

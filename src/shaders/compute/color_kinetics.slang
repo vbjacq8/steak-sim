@@ -10,7 +10,7 @@ static const uint CELL_SOLID = 1u;
 
 struct ColorPush {
     uint3 dims;
-    float dt; // unused here; present so every color pass shares one push-constant layout
+    float referenceY; // luminance of the texture's typical meat, see cookedLab
 };
 
 [[vk::push_constant]]
@@ -53,5 +53,5 @@ void colorKineticsMain(uint3 id : SV_DispatchThreadID) {
     float tC = (temperature[i] - 32.0) * (5.0 / 9.0);
     float peak = max(peakCelsius[id], tC);
     peakCelsius[id] = peak;
-    labOut[id] = float4(cookedLab(lab0[id].rgb, peak), current.a);
+    labOut[id] = float4(cookedLab(lab0[id].rgb, peak, params.referenceY), current.a);
 }

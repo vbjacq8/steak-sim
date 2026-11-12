@@ -2,8 +2,8 @@
 //
 // The mesh is in centimeters and is voxelized with cells HeatParams::spacing wide. Every voxel the steak
 // touches conducts heat. The empty z = 0 layer is the pan, and the air around it convects at
-// HeatParams::airTransfer. After each heat step, a* of the 3D color texture moves toward the paper
-// equilibrium at that voxel's temperature. The window starts on the temperature field; C switches solid
+// HeatParams::airTransfer. After each heat step, every voxel's color follows the doneness table for the
+// hottest temperature it has reached. The window starts on the temperature field; C switches solid
 // cells to that cooked color so the two can be compared. The pan stays on the temperature key.
 // V switches from the voxel blocks to the textured mesh. Cooked color on that mesh samples the voxels.
 // Interior voxels take the UV of the nearest surface point, so the crust texture bleeds inward.
@@ -14,7 +14,8 @@
 // A glTF with several base-color images, such as src/assets/steak2/*.glb, packs those images into one
 // atlas so the fat cap and the lean each keep their own texture. A model that is not already about
 // the size of a steak (its long axis, read as centimeters, outside 5–45 cm) is scaled so that axis is
-// 22 cm. Overlapping duplicate shells are dropped.
+// 22 cm. Overlapping duplicate shells are dropped. Side walls whose texture coordinates collapse to a
+// line (a top-down projection) are given coordinates that wrap around the steak instead.
 
 #include "heat_view.hpp"
 #include "mesh_loader.hpp"
@@ -103,6 +104,55 @@ struct DemoMesh{
     float metersPerUnit = 0.01f;
 };
 
+// Texture coordinates for a part's vertical walls whose own coordinates have no area, as when a model is
+// mapped by projecting straight down. The angle around the part's center runs across the part's UV box,
+// mirrored at 0 and pi so there is no seam, and height runs up it at the same texel density.
+struct WallMapping{
+    glm::vec2 center{};
+    float zLow = 0.0f;
+    glm::vec2 uvLow{};
+    glm::vec2 uvHigh{};
+    float vPerUnit = 0.0f;
+
+    glm::vec2 uv(glm::vec3 p) const{
+        const float angle = std::abs(std::atan2(p.y - center.y, p.x - center.x)) / 3.14159265f;
+        return {uvLow.x + (uvHigh.x - uvLow.x) * angle, std::min(uvLow.y + (p.z - zLow) * vPerUnit, uvHigh.y)};
+    }
+};
+
+bool isFlatWall(const Mesh& mesh, const uint32_t tri[3]){
+    const glm::vec3 a = mesh.positions[tri[0]], b = mesh.positions[tri[1]], c = mesh.positions[tri[2]];
+    const glm::vec3 normal = glm::cross(b - a, c - a);
+    const float area = glm::length(normal);
+    if (!(area > 0.0f) || std::abs(normal.z) > 0.5f * area) return false;
+    const glm::vec2 e1 = mesh.texcoords[tri[1]] - mesh.texcoords[tri[0]];
+    const glm::vec2 e2 = mesh.texcoords[tri[2]] - mesh.texcoords[tri[0]];
+    return std::abs(e1.x * e2.y - e1.y * e2.x) < 1.0e-10f;
+}
+
+WallMapping wallMapping(const Mesh& mesh, const MeshPart& part, int imageWidth, int imageHeight){
+    WallMapping mapping;
+    glm::vec3 low(std::numeric_limits<float>::infinity());
+    glm::vec3 high(-std::numeric_limits<float>::infinity());
+    mapping.uvLow = glm::vec2(std::numeric_limits<float>::infinity());
+    mapping.uvHigh = glm::vec2(-std::numeric_limits<float>::infinity());
+    for (uint32_t n = 0; n < part.indexCount; ++n){
+        const uint32_t i = mesh.indices[part.indexOffset + n];
+        low = glm::min(low, mesh.positions[i]);
+        high = glm::max(high, mesh.positions[i]);
+        mapping.uvLow = glm::min(mapping.uvLow, mesh.texcoords[i]);
+        mapping.uvHigh = glm::max(mapping.uvHigh, mesh.texcoords[i]);
+    }
+    mapping.center = 0.5f * (glm::vec2(low) + glm::vec2(high));
+    mapping.zLow = low.z;
+    // Half the perimeter of the part's bounding ellipse spans the U range.
+    const glm::vec2 radius = 0.5f * (glm::vec2(high) - glm::vec2(low));
+    const float halfPerimeter = 3.14159265f * std::sqrt(0.5f * (radius.x * radius.x + radius.y * radius.y));
+    const float pixelsPerUnit = (mapping.uvHigh.x - mapping.uvLow.x) * static_cast<float>(imageWidth) / std::max(halfPerimeter, 1.0e-6f);
+    mapping.vPerUnit = pixelsPerUnit / static_cast<float>(imageHeight);
+    return mapping;
+}
+
 int imageForMaterial(const Mesh& mesh, int material){
     if (material < 0 || static_cast<size_t>(material) >= mesh.materials.size()){
         throw std::runtime_error("mesh part has no material");
@@ -154,27 +204,41 @@ DemoMesh prepareDemoMesh(const Mesh& source, const std::string& fallbackTexture)
         }
     }
 
+    size_t rewrapped = 0;
     for (const MeshPart& part : mesh.parts){
         const int image = imageForMaterial(mesh, part.material);
         const RgbaImage& src = decoded[static_cast<size_t>(image)];
-        std::vector<int> remap(mesh.positions.size(), -1);
+        const auto addVertex = [&](glm::vec3 position, glm::vec2 uv){
+            const float su = (uv.x * static_cast<float>(src.width) + static_cast<float>(originX[static_cast<size_t>(image)])) /
+                             static_cast<float>(atlasWidth);
+            const float sv = uv.y * static_cast<float>(src.height) / static_cast<float>(atlasHeight);
+            out.positions.push_back(position);
+            out.solverUvs.push_back({su, sv});
+            out.displayUvs.push_back({su, 1.0f - sv});
+            return static_cast<uint32_t>(out.positions.size() - 1);
+        };
+        if (part.indexCount % 3 != 0) throw std::runtime_error("mesh part is not a triangle list");
         for (uint32_t n = 0; n < part.indexCount; ++n){
             const uint32_t srcIndex = mesh.indices[part.indexOffset + n];
             if (srcIndex >= mesh.positions.size() || srcIndex >= mesh.texcoords.size()){
                 throw std::runtime_error("mesh part index is out of range");
             }
-            int& slot = remap[srcIndex];
-            if (slot < 0){
-                slot = static_cast<int>(out.positions.size());
-                out.positions.push_back(mesh.positions[srcIndex]);
-                const glm::vec2 uv = mesh.texcoords[srcIndex];
-                const float su = (uv.x * static_cast<float>(src.width) + static_cast<float>(originX[static_cast<size_t>(image)])) /
-                                 static_cast<float>(atlasWidth);
-                const float sv = uv.y * static_cast<float>(src.height) / static_cast<float>(atlasHeight);
-                out.solverUvs.push_back({su, sv});
-                out.displayUvs.push_back({su, 1.0f - sv});
+        }
+        const WallMapping walls = wallMapping(mesh, part, src.width, src.height);
+        std::vector<int> remap(mesh.positions.size(), -1);
+        for (uint32_t n = 0; n < part.indexCount; n += 3){
+            const uint32_t tri[3] = {mesh.indices[part.indexOffset + n], mesh.indices[part.indexOffset + n + 1],
+                                     mesh.indices[part.indexOffset + n + 2]};
+            if (isFlatWall(mesh, tri)){
+                ++rewrapped;
+                for (uint32_t srcIndex : tri) out.indices.push_back(addVertex(mesh.positions[srcIndex], walls.uv(mesh.positions[srcIndex])));
+                continue;
             }
-            out.indices.push_back(static_cast<uint32_t>(slot));
+            for (uint32_t srcIndex : tri){
+                int& slot = remap[srcIndex];
+                if (slot < 0) slot = static_cast<int>(addVertex(mesh.positions[srcIndex], mesh.texcoords[srcIndex]));
+                out.indices.push_back(static_cast<uint32_t>(slot));
+            }
         }
     }
     if (out.positions.empty()) throw std::runtime_error("mesh has no triangles");
@@ -183,6 +247,7 @@ DemoMesh prepareDemoMesh(const Mesh& source, const std::string& fallbackTexture)
         std::cout << "Dropped " << source.parts.size() - mesh.parts.size() << " overlapping duplicate part"
                   << (source.parts.size() - mesh.parts.size() == 1 ? "" : "s") << "\n";
     }
+    if (rewrapped > 0) std::cout << "Rewrapped texture coordinates on " << rewrapped << " side-wall triangles\n";
     std::cout << "Packed " << decoded.size() << " base-color images into a " << atlasWidth << "x" << atlasHeight << " atlas\n";
     return out;
 }

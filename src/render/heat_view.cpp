@@ -11,7 +11,6 @@
 #include "reset_dialog.hpp"
 #include "voxelizer.hpp"
 
-#include <queue>
 
 #include <open3d/Open3D.h>
 #include <open3d/visualization/rendering/ColorGrading.h>
@@ -299,90 +298,122 @@ std::shared_ptr<open3d::geometry::Image> makeAlbedo(const HeatSurface& surface){
     return image;
 }
 
-bool isSurfaceCell(const HeatGrid& grid, int x, int y, int z){
-    if (grid.kind(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z)) != CELL_SOLID) return false;
-    const int offset[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
-    for (const auto& step : offset){
-        const int nx = x + step[0];
-        const int ny = y + step[1];
-        const int nz = z + step[2];
-        if (nx < 0 || ny < 0 || nz < 0 || nx >= static_cast<int>(grid.dims.x) || ny >= static_cast<int>(grid.dims.y) ||
-            nz >= static_cast<int>(grid.dims.z) ||
-            grid.kind(static_cast<uint32_t>(nx), static_cast<uint32_t>(ny), static_cast<uint32_t>(nz)) != CELL_SOLID){
-            return true;
+// Peak temperature at a model-space point, trilinear over the solid cells around it. Cells that are not
+// meat get no weight, so a point on the surface takes the outermost meat layer's value.
+float samplePeak(const HeatGrid& grid, const GridFrame& frame, glm::vec3 position){
+    const glm::vec3 coord = (position - frame.origin) / frame.voxelSize - 0.5f;
+    const glm::ivec3 base(glm::floor(coord));
+    const glm::vec3 t = coord - glm::vec3(base);
+    const auto solidAt = [&](glm::ivec3 c){
+        return c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < static_cast<int>(grid.dims.x) && c.y < static_cast<int>(grid.dims.y) &&
+               c.z < static_cast<int>(grid.dims.z) &&
+               grid.kind(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y), static_cast<uint32_t>(c.z)) == CELL_SOLID;
+    };
+    const auto peakAt = [&](glm::ivec3 c){
+        return grid.peakCelsius[grid.index(static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y), static_cast<uint32_t>(c.z))];
+    };
+    float weight = 0.0f;
+    float sum = 0.0f;
+    for (int corner = 0; corner < 8; ++corner){
+        const glm::ivec3 offset((corner & 1) ? 1 : 0, (corner & 2) ? 1 : 0, (corner & 4) ? 1 : 0);
+        if (!solidAt(base + offset)) continue;
+        const float w = (offset.x ? t.x : 1.0f - t.x) * (offset.y ? t.y : 1.0f - t.y) * (offset.z ? t.z : 1.0f - t.z);
+        weight += w;
+        sum += w * peakAt(base + offset);
+    }
+    if (weight > 1.0e-6f) return sum / weight;
+    // Mesh and voxels disagree by up to a cell at thin spots; take the nearest meat within one cell.
+    const glm::ivec3 nearest(glm::round(coord));
+    float best = std::numeric_limits<float>::max();
+    float peak = kNoPeakCelsius;
+    for (int dz = -1; dz <= 1; ++dz){
+        for (int dy = -1; dy <= 1; ++dy){
+            for (int dx = -1; dx <= 1; ++dx){
+                const glm::ivec3 c = nearest + glm::ivec3(dx, dy, dz);
+                if (!solidAt(c)) continue;
+                const float distance = glm::length(glm::vec3(c) - coord);
+                if (distance < best){
+                    best = distance;
+                    peak = peakAt(c);
+                }
+            }
         }
     }
-    return false;
+    return peak;
 }
 
-// Photo-resolution cook. Each surface voxel contributes its peak temperature at the texel it sampled,
-// on the albedo page for its side of the mesh, and every texel is cooked from its own Lab with the
-// nearest peak on its page, the same doneness table as the voxels. Marbling stays the albedo's instead
-// of being smeared across voxels.
+// Photo-resolution cook. Every triangle is rasterized into its albedo page; each covered texel finds its
+// model-space point, samples the peak temperature there, and is cooked from its own Lab with the same
+// doneness table as the voxels. The texture keeps its own detail, and the cook varies smoothly instead
+// of in voxel-sized blocks.
 std::shared_ptr<open3d::geometry::Image> bakeCookedAlbedo(const HeatGrid& grid, const HeatSurface& surface){
     auto image = makeAlbedo(surface);
-    if (!image || grid.peakCelsius.size() != grid.cellCount() || grid.sampleUv.size() != grid.cellCount()) return image;
+    if (!image || grid.peakCelsius.size() != grid.cellCount()) return image;
     const GridFrame frame = gridFrame(grid, surface);
     const int pageWidth = surface.width;
     const int width = pageWidth * kAlbedoPages;
     const int height = surface.height;
-    const size_t texels = static_cast<size_t>(width) * height;
-    std::vector<float> peakSum(texels, 0.0f);
-    std::vector<float> peakWeight(texels, 0.0f);
-    for (int z = 0; z < static_cast<int>(grid.dims.z); ++z){
-        for (int y = 0; y < static_cast<int>(grid.dims.y); ++y){
-            for (int x = 0; x < static_cast<int>(grid.dims.x); ++x){
-                if (!isSurfaceCell(grid, x, y, z)) continue;
-                const glm::vec2 uv = grid.sampleUv[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
-                if (uv.x < 0.0f || uv.y < 0.0f || uv.x > 1.0f || uv.y > 1.0f) continue;
-                const float centerZ = frame.origin.z + (static_cast<float>(z) + 0.5f) * frame.voxelSize;
-                const int page = belowMid(frame, centerZ) ? 1 : 0;
-                const int px = std::clamp(static_cast<int>(std::lround(uv.x * (pageWidth - 1))), 0, pageWidth - 1) + page * pageWidth;
-                const int py = std::clamp(static_cast<int>(std::lround(uv.y * (height - 1))), 0, height - 1);
-                const size_t texel = static_cast<size_t>(py) * width + px;
-                peakSum[texel] += grid.peakCelsius[grid.index(static_cast<uint32_t>(x), static_cast<uint32_t>(y), static_cast<uint32_t>(z))];
-                peakWeight[texel] += 1.0f;
+    std::vector<float> peak(static_cast<size_t>(width) * height, std::numeric_limits<float>::quiet_NaN());
+
+    for (size_t t = 0; t + 2 < surface.indices.size(); t += 3){
+        const uint32_t ids[3] = {surface.indices[t], surface.indices[t + 1], surface.indices[t + 2]};
+        if (ids[0] >= surface.positions.size() || ids[1] >= surface.positions.size() || ids[2] >= surface.positions.size()) continue;
+        const glm::vec3 p[3] = {surface.positions[ids[0]], surface.positions[ids[1]], surface.positions[ids[2]]};
+        const int page = belowMid(frame, (p[0].z + p[1].z + p[2].z) / 3.0f) ? 1 : 0;
+        // Display UVs are V up; image rows run top first.
+        glm::vec2 q[3];
+        for (int c = 0; c < 3; ++c){
+            const glm::vec2 uv = surface.texcoords[ids[c]];
+            q[c] = {(uv.x + static_cast<float>(page)) * static_cast<float>(pageWidth), (1.0f - uv.y) * static_cast<float>(height)};
+        }
+        const float area = (q[1].x - q[0].x) * (q[2].y - q[0].y) - (q[2].x - q[0].x) * (q[1].y - q[0].y);
+        if (!(std::abs(area) > 1.0e-8f)) continue;
+        const int x0 = std::max(static_cast<int>(std::floor(std::min({q[0].x, q[1].x, q[2].x}))), page * pageWidth);
+        const int x1 = std::min(static_cast<int>(std::ceil(std::max({q[0].x, q[1].x, q[2].x}))), (page + 1) * pageWidth - 1);
+        const int y0 = std::max(static_cast<int>(std::floor(std::min({q[0].y, q[1].y, q[2].y}))), 0);
+        const int y1 = std::min(static_cast<int>(std::ceil(std::max({q[0].y, q[1].y, q[2].y}))), height - 1);
+        for (int y = y0; y <= y1; ++y){
+            for (int x = x0; x <= x1; ++x){
+                const glm::vec2 c(static_cast<float>(x) + 0.5f, static_cast<float>(y) + 0.5f);
+                const float b1 = ((c.x - q[0].x) * (q[2].y - q[0].y) - (q[2].x - q[0].x) * (c.y - q[0].y)) / area;
+                const float b2 = ((q[1].x - q[0].x) * (c.y - q[0].y) - (c.x - q[0].x) * (q[1].y - q[0].y)) / area;
+                const float b0 = 1.0f - b1 - b2;
+                constexpr float kEdge = -1.0e-4f;
+                if (b0 < kEdge || b1 < kEdge || b2 < kEdge) continue;
+                peak[static_cast<size_t>(y) * width + x] = samplePeak(grid, frame, b0 * p[0] + b1 * p[1] + b2 * p[2]);
             }
         }
     }
 
-    constexpr int kMaxSpread = 64;
-    std::vector<int> distance(texels, kMaxSpread + 1);
-    std::vector<float> peak(texels, kNoPeakCelsius);
-    std::queue<std::pair<int, int>> wave;
-    for (int y = 0; y < height; ++y){
-        for (int x = 0; x < width; ++x){
-            const size_t texel = static_cast<size_t>(y) * width + x;
-            if (!(peakWeight[texel] > 0.0f)) continue;
-            distance[texel] = 0;
-            peak[texel] = peakSum[texel] / peakWeight[texel];
-            wave.emplace(x, y);
+    // Grow each island by a few texels so bilinear filtering at its edges does not pull in raw texels.
+    constexpr int kBleed = 3;
+    for (int pass = 0; pass < kBleed; ++pass){
+        std::vector<float> grown = peak;
+        for (int y = 0; y < height; ++y){
+            for (int x = 0; x < width; ++x){
+                const size_t texel = static_cast<size_t>(y) * width + x;
+                if (!std::isnan(peak[texel])) continue;
+                const int neighbor[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+                for (const auto& step : neighbor){
+                    const int nx = x + step[0];
+                    const int ny = y + step[1];
+                    if (nx < 0 || ny < 0 || nx >= width || ny >= height || nx / pageWidth != x / pageWidth) continue;
+                    const float value = peak[static_cast<size_t>(ny) * width + nx];
+                    if (!std::isnan(value)){
+                        grown[texel] = value;
+                        break;
+                    }
+                }
+            }
         }
-    }
-    while (!wave.empty()){
-        const auto [x, y] = wave.front();
-        wave.pop();
-        const size_t texel = static_cast<size_t>(y) * width + x;
-        const int next = distance[texel] + 1;
-        if (next > kMaxSpread) continue;
-        const int neighbor[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-        for (const auto& step : neighbor){
-            const int nx = x + step[0];
-            const int ny = y + step[1];
-            if (nx < 0 || ny < 0 || nx >= width || ny >= height || nx / pageWidth != x / pageWidth) continue;
-            const size_t nextTexel = static_cast<size_t>(ny) * width + nx;
-            if (distance[nextTexel] <= next) continue;
-            distance[nextTexel] = next;
-            peak[nextTexel] = peak[texel];
-            wave.emplace(nx, ny);
-        }
+        peak.swap(grown);
     }
 
-    for (size_t texel = 0; texel < texels; ++texel){
-        if (distance[texel] > kMaxSpread) continue;
+    for (size_t texel = 0; texel < peak.size(); ++texel){
+        if (std::isnan(peak[texel])) continue;
         const size_t byte = texel * 3;
         const glm::vec3 encoded{image->data_[byte] / 255.0f, image->data_[byte + 1] / 255.0f, image->data_[byte + 2] / 255.0f};
-        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), peak[texel]);
+        const glm::vec3 lab = cookedLab(linearSrgbToLab(srgbToLinear(encoded)), peak[texel], grid.colorReferenceY);
         const glm::vec3 out = linearToSrgb(labToLinearSrgb(lab));
         image->data_[byte] = static_cast<uint8_t>(std::lround(out.x * 255.0f));
         image->data_[byte + 1] = static_cast<uint8_t>(std::lround(out.y * 255.0f));

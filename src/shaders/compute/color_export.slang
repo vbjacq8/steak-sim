@@ -7,7 +7,7 @@ import lab_color;
 
 struct ColorPush {
     uint3 dims;
-    float dt;
+    float referenceY; // unused here; present so every color pass shares one push-constant layout
 };
 
 [[vk::push_constant]]

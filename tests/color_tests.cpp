@@ -80,18 +80,35 @@ TEST(ColorModel, DonenessTableInterpolation){
 
 TEST(ColorModel, CookedLabGoesFromRedToBrown){
     const glm::vec3 raw{52.8f, 41.2f, 27.0f};
-    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius), raw);
-    EXPECT_EQ(cookedLab(raw, 30.0f), raw);
+    const float referenceY = labLuminance(raw);
+    EXPECT_EQ(cookedLab(raw, kNoPeakCelsius, referenceY), raw);
+    EXPECT_EQ(cookedLab(raw, 30.0f, referenceY), raw);
 
-    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f));
-    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f));
-    const glm::vec3 crust = cookedLab(raw, 170.0f);
+    const glm::vec3 rare = cookedLab(raw, fahrenheitToCelsius(120.0f), referenceY);
+    const glm::vec3 wellDone = cookedLab(raw, fahrenheitToCelsius(160.0f), referenceY);
+    const glm::vec3 crust = cookedLab(raw, 170.0f, referenceY);
     EXPECT_LT(rare.y, raw.y);
     EXPECT_LT(wellDone.y, rare.y - 10.0f);
     EXPECT_GT(wellDone.x, rare.x);
     EXPECT_LT(crust.x, wellDone.x);
     EXPECT_LT(crust.y, wellDone.y);
-    EXPECT_LT(channelError(crust, kDonenessKeys[kDonenessKeyCount - 1].lab), 1e-4f);
+    // A texel as bright as the reference takes the table color exactly.
+    EXPECT_LT(channelError(crust, kDonenessKeys[kDonenessKeyCount - 1].lab), 0.05f);
+}
+
+TEST(ColorModel, CookedColorKeepsTextureLightness){
+    const glm::vec3 meat{52.8f, 41.2f, 27.0f};
+    const glm::vec3 fat{85.0f, 4.0f, 15.0f};
+    const float referenceY = labLuminance(meat);
+    const glm::vec3 meatCrust = cookedLab(meat, 170.0f, referenceY);
+    const glm::vec3 fatCrust = cookedLab(fat, 170.0f, referenceY);
+    const glm::vec3 darkCrust = cookedLab({40.0f, 35.0f, 25.0f}, 170.0f, referenceY);
+    EXPECT_GT(fatCrust.x, meatCrust.x + 5.0f);
+    EXPECT_LT(fatCrust.x, fat.x);
+    EXPECT_LT(darkCrust.x, meatCrust.x);
+    // Scaling linear RGB keeps the table's hue: fat browns instead of staying white.
+    EXPECT_GT(fatCrust.y, 5.0f);
+    EXPECT_GT(fatCrust.z, 10.0f);
 }
 
 TEST(ColorModel, PeakOnlyRises){
@@ -170,7 +187,8 @@ TEST(ColorSolver, GpuColorMatchesCpu){
 
     float peak = kNoPeakCelsius;
     for (float temperature : schedule) peak = raisePeak(peak, temperature);
-    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak);
+    EXPECT_GT(solved.referenceLuminance(), 0.0f);
+    const glm::vec3 expected = cookedLab(glm::vec3(lab0), peak, solved.referenceLuminance());
     EXPECT_NEAR(solved.lab()[0].x, expected.x, 0.25f);
     EXPECT_NEAR(solved.lab()[0].y, expected.y, 0.25f);
     EXPECT_NEAR(solved.lab()[0].z, expected.z, 0.25f);

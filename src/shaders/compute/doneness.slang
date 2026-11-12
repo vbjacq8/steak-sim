@@ -5,6 +5,8 @@
 // both linear in temperature between keys. Below the first key nothing changes; above the last key
 // the last one holds.
 
+import lab_color;
+
 struct DonenessKey {
     float celsius;
     float3 lab;
@@ -36,7 +38,17 @@ float4 donenessAt(float peakCelsius) {
     return float4(lo.lab + (hi.lab - lo.lab) * w, lo.strength + (hi.strength - lo.strength) * w);
 }
 
-float3 cookedLab(float3 lab0, float peakCelsius) {
+// Share of the texture's lightness pattern kept by the cooked color (kTextureDetail).
+static const float TEXTURE_DETAIL = 0.5;
+
+float labLuminance(float3 lab) { return labWhiteY() * labFInv((lab.x + 16.0) / 116.0); }
+
+// w of donenessAt is the cooked fraction. The cooked color is the table color scaled by
+// (texel luminance / referenceY)^TEXTURE_DETAIL in linear RGB.
+float3 cookedLab(float3 lab0, float peakCelsius, float referenceY) {
     float4 d = donenessAt(peakCelsius);
-    return lab0 + (d.xyz - lab0) * d.w;
+    if (!(d.w > 0.0)) return lab0;
+    float detail = pow(max(labLuminance(lab0), 0.0) / max(referenceY, 1.0e-4), TEXTURE_DETAIL);
+    float3 cooked = linearSrgbToLab(clamp(labToLinearSrgb(d.xyz) * detail, 0.0, 1.0));
+    return lab0 + (cooked - lab0) * d.w;
 }
